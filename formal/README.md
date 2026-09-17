@@ -21,8 +21,8 @@ python formal/verify.py --jobs 4
 ```
 
 The script finds `proverif` on `PATH`, in `~/.opam/default/bin`, or through the
-`PROVERIF` environment variable. A full run needs about 40 CPU minutes, which took
-just over 4 minutes on 12 threads. It exits with status 1 if any result differs from
+`PROVERIF` environment variable. A full run needs about 45 CPU minutes, which took
+about 5 minutes on 12 threads. It exits with status 1 if any result differs from
 the claims below. The ProVerif output of a failed run is kept in a temporary
 directory, and the script prints its path.
 
@@ -90,6 +90,8 @@ attack trace. That shows the element is needed, and that the model is able to fa
 | Peer fingerprint in the proof | nothing broken | Unknown key share: the responder accepts an initiator that meant to reach someone else |
 | ML-KEM from the key derivation | X25519 broken | Traffic readable and forgeable |
 | X25519 from the key derivation | ML-KEM broken | Traffic readable and forgeable |
+| Separate traffic key per direction | nothing broken | A frame reflected back to its sender is accepted as the peer's message |
+| Frame counter in the nonce | nothing broken | The initiator's session proof, replayed, is accepted as application data |
 | SLH-DSA check in hybrid verify | ML-DSA broken | Forged session proofs and signatures |
 
 ## What the model does not cover

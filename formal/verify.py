@@ -105,6 +105,23 @@ MUTANTS = (
         ("secrecy_i2r", "secrecy_r2i", "integrity_i2r", "integrity_r2i"),
     ),
     Mutant(
+        "one traffic key for both directions",
+        (
+            (
+                "fun block_key_r2i(bitstring): key.",
+                "letfun block_key_r2i(okm: bitstring) = block_key_i2r(okm).",
+            ),
+        ),
+        frozenset(),
+        ("integrity_i2r", "integrity_r2i"),
+    ),
+    Mutant(
+        "every frame under the same nonce",
+        (("const N1: nonce.  (* counter 1: the first application message *)", "letfun N1 = N0."),),
+        frozenset(),
+        ("integrity_i2r", "integrity_r2i"),
+    ),
+    Mutant(
         "hybrid signature that only checks ML-DSA",
         (
             (
