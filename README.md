@@ -496,6 +496,11 @@ The suite has 83 tests and runs in about 13 seconds. Among other things it cover
 
 Continuous integration runs the suite on Python 3.10 to 3.14.
 
+The channel's design is also checked separately with a symbolic
+[ProVerif model](formal/README.md). It covers authentication, secrecy and integrity
+with any combination of primitives broken, now or later. This doesn't replace an
+independent review.
+
 ## Origin, security reports and license
 
 hybride-pq is the cryptographic layer of **Pingobit**, an educational post-quantum

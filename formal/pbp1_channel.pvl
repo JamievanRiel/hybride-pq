@@ -1,0 +1,289 @@
+(* PBP-1 secure channel: a symbolic model for ProVerif 2.05.
+
+   Covers docs/PROTOCOL.md section 4: the hybrid X25519 + ML-KEM-768 handshake
+   and key schedule (4.1), the first ChaCha20-Poly1305 frame in each direction
+   (4.2) and session binding with hybrid session proofs (4.4). Ordinary sign()
+   signatures (section 3) are in the model as well, because an application may
+   hand them out freely next to a channel.
+
+   This file holds no process. formal/verify.py supplies one, of the form
+   "process System(...)", whose arguments decide which primitives the attacker
+   can break, and when. Read formal/README.md for the scenarios, the expected
+   results and what the model leaves out. *)
+
+free c: channel.
+
+(* ------------------------------------------------------------------ labels *)
+
+(* Every field in a PBP-1 handshake message and session proof has a fixed
+   length, so those byte strings parse in exactly one way. That justifies
+   modelling them as tuples. *)
+const MAGIC: bitstring.          (* "PBP1N1", also the AEAD associated data *)
+const INFO_DOMAIN: bitstring.    (* "PBP1.net.v1" *)
+const AUTH_DOMAIN: bitstring.    (* "PBP1.auth.v1" || 0x00 *)
+const ROLE_I: bitstring.         (* "I" *)
+const ROLE_R: bitstring.         (* "R" *)
+const AUTH_CONTEXT: bitstring.   (* FIPS 204/205 context string "PBP1.auth.v1" *)
+const EMPTY_CONTEXT: bitstring.  (* the context string of ordinary sign() *)
+
+(* ------------------------------------------------------------------ X25519 *)
+
+type exponent.
+type G.
+const g: G [data].
+fun exp(G, exponent): G.
+equation forall x: exponent, y: exponent; exp(exp(g, x), y) = exp(exp(g, y), x).
+
+(* -------------------------------------------------------------- ML-KEM-768 *)
+
+type dk.
+type coins.
+fun mlkem_ek(dk): bitstring.
+fun mlkem_ct(bitstring, coins): bitstring.  (* encapsulation key, randomness *)
+fun mlkem_ss(bitstring, coins): bitstring.
+(* FIPS 203 implicit rejection: decapsulating a ciphertext that was not made for
+   this key gives a pseudorandom key that only the key owner can compute. *)
+fun mlkem_reject(dk, bitstring): bitstring [private].
+fun mlkem_decaps(dk, bitstring): bitstring
+reduc forall d: dk, r: coins;
+  mlkem_decaps(d, mlkem_ct(mlkem_ek(d), r)) = mlkem_ss(mlkem_ek(d), r)
+otherwise forall d: dk, ct: bitstring;
+  mlkem_decaps(d, ct) = mlkem_reject(d, ct).
+
+(* ------------------------------------------------------ HKDF-SHA3-256, SHA3 *)
+
+type key.
+(* A random oracle over IKM = ss_x || ss_k and info. Both shared secrets are
+   separate arguments, so computing the output takes both of them: this is the
+   assumption that HKDF-SHA3-256 is a sound combiner (README "Security levels"). *)
+fun hkdf(G, bitstring, bitstring): bitstring.
+(* out[0:32], out[32:64], out[64:96]: knowing one block reveals no other. *)
+fun block_key_i2r(bitstring): key.
+fun block_key_r2i(bitstring): key.
+fun block_session_id(bitstring): bitstring.
+fun sha3(bitstring): bitstring.
+
+(* ------------------------------------------------------- ChaCha20-Poly1305 *)
+
+type nonce.
+const N0: nonce.  (* counter 0: the session proof *)
+const N1: nonce.  (* counter 1: the first application message *)
+fun aead_enc(key, nonce, bitstring, bitstring): bitstring.
+reduc forall k: key, n: nonce, m: bitstring, ad: bitstring;
+  aead_dec(k, n, aead_enc(k, n, m, ad), ad) = m.
+
+(* ------------------------------------------ ML-DSA-65, SLH-DSA-SHAKE-128s *)
+
+type sk_mldsa.
+type sk_slh.
+fun pk_mldsa(sk_mldsa): bitstring.
+fun pk_slh(sk_slh): bitstring.
+fun sign_mldsa(sk_mldsa, bitstring, bitstring): bitstring.  (* key, context, message *)
+fun sign_slh(sk_slh, bitstring, bitstring): bitstring.
+reduc forall s: sk_mldsa, ctx: bitstring, m: bitstring;
+  verify_mldsa(pk_mldsa(s), ctx, m, sign_mldsa(s, ctx, m)) = true.
+reduc forall s: sk_slh, ctx: bitstring, m: bitstring;
+  verify_slh(pk_slh(s), ctx, m, sign_slh(s, ctx, m)) = true.
+(* A signature does not hide what it signs. *)
+reduc forall s: sk_mldsa, ctx: bitstring, m: bitstring;
+  signed_message_mldsa(sign_mldsa(s, ctx, m)) = m.
+reduc forall s: sk_slh, ctx: bitstring, m: bitstring;
+  signed_message_slh(sign_slh(s, ctx, m)) = m.
+
+letfun public_key(a: sk_mldsa, b: sk_slh) = (pk_mldsa(a), pk_slh(b)).
+
+letfun hybrid_sign(a: sk_mldsa, b: sk_slh, ctx: bitstring, m: bitstring) =
+  (sign_mldsa(a, ctx, m), sign_slh(b, ctx, m)).
+
+letfun hybrid_verify(pk: bitstring, ctx: bitstring, m: bitstring, s: bitstring) =
+  let (pka: bitstring, pkb: bitstring) = pk in
+  let (sa: bitstring, sb: bitstring) = s in
+  verify_mldsa(pka, ctx, m, sa) && verify_slh(pkb, ctx, m, sb).
+
+(* ------------------------------------------------------ breaking primitives *)
+
+(* A break hands the attacker the secret behind any public value of that
+   primitive: what Shor's algorithm does to X25519, or what a new cryptanalytic
+   result could do to any of the others. The destructors are private; Breaks()
+   turns them into attacker oracles only in the scenarios that break them. *)
+reduc forall x: exponent; break_x25519(exp(g, x)) = x [private].
+reduc forall d: dk; break_mlkem(mlkem_ek(d)) = d [private].
+reduc forall s: sk_mldsa; break_mldsa(pk_mldsa(s)) = s [private].
+reduc forall s: sk_slh; break_slh(pk_slh(s)) = s [private].
+
+(* --------------------------------------------------------- PBP-1 functions *)
+
+letfun derive(ss_x: G, ss_k: bitstring, hello_i: bitstring, hello_r: bitstring) =
+  hkdf(ss_x, ss_k, (INFO_DOMAIN, hello_i, hello_r)).
+
+letfun proof_message(role: bitstring, session: bitstring, signer: bitstring, peer: bitstring) =
+  (AUTH_DOMAIN, role, session, sha3(signer), sha3(peer)).
+
+letfun sign_proof(a: sk_mldsa, b: sk_slh, m: bitstring) = hybrid_sign(a, b, AUTH_CONTEXT, m).
+
+letfun verify_proof(pk: bitstring, m: bitstring, s: bitstring) = hybrid_verify(pk, AUTH_CONTEXT, m, s).
+
+(* ------------------------------------------------------------------ events *)
+
+(* Arguments: initiator key, responder key, session id, key i->r, key r->i. *)
+event InitProves(bitstring, bitstring, bitstring, key, key).
+event InitAccepts(bitstring, bitstring, bitstring, key, key).
+event RespAccepts(bitstring, bitstring, bitstring, key, key).
+(* Arguments: initiator key, responder key, session id, application message. *)
+event InitSends(bitstring, bitstring, bitstring, bitstring).
+event RespSends(bitstring, bitstring, bitstring, bitstring).
+event InitReceives(bitstring, bitstring, bitstring, bitstring).
+event RespReceives(bitstring, bitstring, bitstring, bitstring).
+(* Arguments: public key, message. *)
+event SigIssued(bitstring, bitstring).
+event SigAccepted(bitstring, bitstring).
+event HonestKey(bitstring).
+
+table honest_keys(bitstring).
+
+(* ----------------------------------------------------------------- queries *)
+
+(* Sanity: honest parties can finish authenticate() and exchange data. ProVerif
+   must answer "false" (reachable). If the model blocked somewhere by mistake,
+   every property below would hold for no reason. *)
+query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
+  event(InitReceives(pkI, pkR, session, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
+query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
+  event(RespReceives(pkI, pkR, session, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
+
+(* Mutual authentication with key agreement: an initiator that accepts an honest
+   responder key is matched by exactly one responder session with that key, which
+   accepted the same initiator key, session id and traffic keys ... *)
+query pkI: bitstring, pkR: bitstring, session: bitstring, k1: key, k2: key;
+  inj-event(InitAccepts(pkI, pkR, session, k1, k2)) && event(HonestKey(pkR))
+  ==> inj-event(RespAccepts(pkI, pkR, session, k1, k2)).
+
+(* ... and a responder that accepts an honest initiator key is matched by exactly
+   one initiator session that proved itself to that responder, on that session. *)
+query pkI: bitstring, pkR: bitstring, session: bitstring, k1: key, k2: key;
+  inj-event(RespAccepts(pkI, pkR, session, k1, k2)) && event(HonestKey(pkI))
+  ==> inj-event(InitProves(pkI, pkR, session, k1, k2)).
+
+(* Confidentiality of data sent after authenticate() to an honest peer, also
+   against an attacker who recorded everything and breaks more later (phase 1). *)
+query secret secret_i2r.
+query secret secret_r2i.
+
+(* Integrity: data received after authenticate() from an honest peer was sent
+   by that peer, on this session. *)
+query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
+  event(RespReceives(pkI, pkR, session, m)) && event(HonestKey(pkI))
+  ==> event(InitSends(pkI, pkR, session, m)).
+query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
+  event(InitReceives(pkI, pkR, session, m)) && event(HonestKey(pkR))
+  ==> event(RespSends(pkI, pkR, session, m)).
+
+(* Domain separation: an ordinary signature that verifies for an honest key was
+   issued by sign(), so a session proof never passes as one. The other direction
+   is covered by the authentication queries, which hold next to SignOracle. *)
+query pk: bitstring, m: bitstring;
+  event(SigAccepted(pk, m)) && event(HonestKey(pk)) ==> event(SigIssued(pk, m)).
+
+(* --------------------------------------------------------------- processes *)
+
+let Initiator(a: sk_mldsa, b: sk_slh, pkI: bitstring) =
+  (* The one responder key this application expects; the attacker may pick it,
+     including a key of its own. *)
+  in(c, pkR: bitstring);
+  new xi: exponent;
+  new d: dk;
+  let hello_i = (MAGIC, exp(g, xi), mlkem_ek(d)) in
+  out(c, hello_i);
+  in(c, hello_r: bitstring);
+  let (=MAGIC, Xr: G, ct: bitstring) = hello_r in
+  let okm = derive(exp(Xr, xi), mlkem_decaps(d, ct), hello_i, hello_r) in
+  let ki2r = block_key_i2r(okm) in
+  let kr2i = block_key_r2i(okm) in
+  let session = block_session_id(okm) in
+  (* authenticate(): the initiator proves first *)
+  event InitProves(pkI, pkR, session, ki2r, kr2i);
+  out(c, aead_enc(ki2r, N0, sign_proof(a, b, proof_message(ROLE_I, session, pkI, pkR)), MAGIC));
+  in(c, frame: bitstring);
+  let proof_r = aead_dec(kr2i, N0, frame, MAGIC) in
+  if verify_proof(pkR, proof_message(ROLE_R, session, pkR, pkI), proof_r) then
+  event InitAccepts(pkI, pkR, session, ki2r, kr2i);
+  (
+    (get honest_keys(=pkR) in
+     new secret_i2r: bitstring;
+     event InitSends(pkI, pkR, session, secret_i2r);
+     out(c, aead_enc(ki2r, N1, secret_i2r, MAGIC)))
+  | (in(c, frame1: bitstring);
+     let m = aead_dec(kr2i, N1, frame1, MAGIC) in
+     event InitReceives(pkI, pkR, session, m))
+  ).
+
+let Responder(a: sk_mldsa, b: sk_slh, pkR: bitstring) =
+  in(c, hello_i: bitstring);
+  let (=MAGIC, Xi: G, ek: bitstring) = hello_i in
+  new r: coins;
+  new xr: exponent;
+  let hello_r = (MAGIC, exp(g, xr), mlkem_ct(ek, r)) in
+  out(c, hello_r);
+  let okm = derive(exp(Xi, xr), mlkem_ss(ek, r), hello_i, hello_r) in
+  let ki2r = block_key_i2r(okm) in
+  let kr2i = block_key_r2i(okm) in
+  let session = block_session_id(okm) in
+  in(c, frame: bitstring);
+  let proof_i = aead_dec(ki2r, N0, frame, MAGIC) in
+  (* The allowed initiator key the proof matched. Any key may be on the allow
+     list, so the attacker picks it, after seeing the frame. *)
+  in(c, pkI: bitstring);
+  if verify_proof(pkI, proof_message(ROLE_I, session, pkI, pkR), proof_i) then
+  event RespAccepts(pkI, pkR, session, ki2r, kr2i);
+  out(c, aead_enc(kr2i, N0, sign_proof(a, b, proof_message(ROLE_R, session, pkR, pkI)), MAGIC));
+  (
+    (get honest_keys(=pkI) in
+     new secret_r2i: bitstring;
+     event RespSends(pkI, pkR, session, secret_r2i);
+     out(c, aead_enc(kr2i, N1, secret_r2i, MAGIC)))
+  | (in(c, frame1: bitstring);
+     let m = aead_dec(ki2r, N1, frame1, MAGIC) in
+     event RespReceives(pkI, pkR, session, m))
+  ).
+
+(* Ordinary sign(). Conservatively it signs any message the attacker picks,
+   without the "PBP1.sig.v1" prefix, so only the context string keeps these
+   signatures apart from session proofs. *)
+let SignOracle(a: sk_mldsa, b: sk_slh, pk: bitstring) =
+  in(c, m: bitstring);
+  event SigIssued(pk, m);
+  out(c, hybrid_sign(a, b, EMPTY_CONTEXT, m)).
+
+(* Ordinary verify(), same conservative choice. *)
+let Verifier =
+  in(c, (pk: bitstring, m: bitstring, s: bitstring));
+  if hybrid_verify(pk, EMPTY_CONTEXT, m, s) then
+  event SigAccepted(pk, m).
+
+(* Any number of honest identities, each running any number of sessions in both
+   roles, so a key can also talk to itself. The attacker makes its own keys. *)
+let Principal =
+  new a: sk_mldsa;
+  new b: sk_slh;
+  let pk = public_key(a, b) in
+  event HonestKey(pk);
+  insert honest_keys(pk);
+  out(c, pk);
+  ((!Initiator(a, b, pk)) | (!Responder(a, b, pk)) | (!SignOracle(a, b, pk))).
+
+let Breaks(x: bool, k: bool, sa: bool, sb: bool) =
+    (if x then !(in(c, p: G); out(c, break_x25519(p))))
+  | (if k then !(in(c, p: bitstring); out(c, break_mlkem(p))))
+  | (if sa then !(in(c, p: bitstring); out(c, break_mldsa(p))))
+  | (if sb then !(in(c, p: bitstring); out(c, break_slh(p)))).
+
+(* Phase 0 is the lifetime of the sessions. Phase 1 is the future: the sessions
+   are over (their ephemeral keys are gone) and the attacker, holding every
+   recorded byte, may break more. Breaking a signature scheme later is the same
+   as stealing every long-term signing key after the fact. *)
+let System(now_x25519: bool, now_mlkem: bool, now_mldsa: bool, now_slh: bool,
+           later_x25519: bool, later_mlkem: bool, later_mldsa: bool, later_slh: bool) =
+    (!Principal)
+  | (!Verifier)
+  | Breaks(now_x25519, now_mlkem, now_mldsa, now_slh)
+  | (phase 1; Breaks(later_x25519, later_mlkem, later_mldsa, later_slh)).
