@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybride-pq"
+version = "0.1.0"
+description = "PBP-1: hybrid post-quantum signatures, encrypted channels and key storage from standardized primitives"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jamie" }]
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=50",
+    "pqcrypto>=1.0,<2",
+    "argon2-cffi>=25.1",
+]
+keywords = ["post-quantum", "cryptography", "ml-dsa", "slh-dsa", "ml-kem", "x25519", "hybrid"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Education",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/JamievanRiel/hybride-pq"
+Issues = "https://github.com/JamievanRiel/hybride-pq/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
