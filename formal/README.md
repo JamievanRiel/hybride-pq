@@ -26,6 +26,10 @@ just over 4 minutes on 12 threads. It exits with status 1 if any result differs 
 the claims below. The ProVerif output of a failed run is kept in a temporary
 directory, and the script prints its path.
 
+Continuous integration ([`formal.yml`](../.github/workflows/formal.yml)) builds
+ProVerif 2.05 from its checksummed source and runs the script. It does this for
+every change to `formal/`, to `docs/PROTOCOL.md` or to the workflow itself.
+
 ## What is modelled
 
 | Part | Model |
