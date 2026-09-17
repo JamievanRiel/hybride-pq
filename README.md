@@ -308,8 +308,10 @@ this library for anything.
    - The protocol has no way for a client to say which key it holds. A server with
      several allowed clients passes all of them to `authenticate`, which tries each
      one (cheap: verifying takes under a millisecond).
-   - Nothing else may use the channel (no `send`, no `recv`, not even from another
-     task) until `authenticate` has returned on your side.
+   - `authenticate` has to be the first thing that happens on a channel, and nothing
+     else may use it until it returns. The channel enforces this: `authenticate`
+     refuses to start on a channel that has already carried data, and `send` and
+     `recv` raise `ChannelError` while it runs.
    - If you build your own flow from `sign_session` and `verify_peer`: a failed
      `verify_peer` does *not* close the channel. Close it yourself when no key matches.
 10. **Metadata is visible.** Message sizes (there is no padding), timing, who talks to
@@ -484,14 +486,15 @@ The trade-off is intentional: signatures are big and slow to create, but verifyi
 .venv/bin/pytest
 ```
 
-The suite has 83 tests and runs in about 13 seconds. Among other things it covers:
+The suite has 88 tests and runs in about 17 seconds. Among other things it covers:
 
 - **Signatures:** round trips, tampering with each half separately, mixing halves from
   different signatures, missing domain separation, and malformed encodings.
 - **Keystore:** tampering in every field, out-of-spec files, and file permissions.
 - **Channel:** replayed, reordered and forged frames, cancelled receives, a simulated
   man in the middle, proofs that are reflected, meant for another peer, or swapped
-  with ordinary signatures, and a server choosing among several allowed keys.
+  with ordinary signatures, a server choosing among several allowed keys, and any
+  other use of the channel while `authenticate` runs.
 - **Formats:** the known-answer vectors.
 
 Continuous integration runs the suite on Python 3.10 to 3.14.

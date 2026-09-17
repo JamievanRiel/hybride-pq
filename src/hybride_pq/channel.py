@@ -108,6 +108,7 @@ class SecureChannel:
         self._send_lock = asyncio.Lock()
         self._recv_lock = asyncio.Lock()
         self._usable = True
+        self._authenticating = False
         self._session_id = session_id
         self._initiator = initiator
 
@@ -176,8 +177,16 @@ class SecureChannel:
         if not self._usable:
             raise ChannelError("channel is closed or failed earlier")
 
+    def _check_not_authenticating(self) -> None:
+        if self._authenticating:
+            raise ChannelError("authenticate is running; nothing else may use the channel")
+
     async def send(self, data: bytes) -> None:
         """Encrypt and send one message of at most :data:`MAX_MESSAGE` bytes."""
+        self._check_not_authenticating()
+        await self._send(data)
+
+    async def _send(self, data: bytes) -> None:
         data = bytes(memoryview(data))  # count bytes, not items; reject int/str
         if len(data) > MAX_MESSAGE:
             raise ChannelError(f"message too large: {len(data)} bytes, limit {MAX_MESSAGE}")
@@ -197,6 +206,10 @@ class SecureChannel:
         Cancelling a pending ``recv`` (for example with ``asyncio.wait_for``) may
         interrupt it mid-frame, so it leaves the channel unusable.
         """
+        self._check_not_authenticating()
+        return await self._recv()
+
+    async def _recv(self) -> bytes:
         async with self._recv_lock:
             self._check_usable()
             try:
@@ -248,9 +261,12 @@ class SecureChannel:
         """Mutual authentication against public keys you already trust.
 
         Both sides call this right after the handshake, and nothing else may use
-        the channel until it returns. The initiator names the one key it expects;
-        the responder may pass a collection of allowed keys. Returns the peer key
-        that matched.
+        the channel until it returns. The channel enforces that: this raises
+        :class:`~hybride_pq.errors.ChannelError`, leaving the channel as it was,
+        if a frame was already sent or received or a ``send``/``recv`` is still
+        pending, and ``send``/``recv`` raise while it runs. The initiator names
+        the one key it expects; the responder may pass a collection of allowed
+        keys. Returns the peer key that matched.
 
         The initiator proves first; the responder only signs after that proof
         checks out, so an anonymous connection cannot make it spend CPU on
@@ -262,13 +278,19 @@ class SecureChannel:
             allowed = [bytes(key) for key in peer_public_bytes]
         if not allowed or (self._initiator and len(allowed) != 1):
             raise ValueError("initiator needs exactly one peer key, responder at least one")
+        # A pending send has already counted its frame; a pending recv has not.
+        if self._authenticating or self._send_counter or self._recv_counter or self._recv_lock.locked():
+            raise ChannelError(
+                "authenticate must run directly after the handshake, with nothing else using the channel"
+            )
         my_public = my_keys.public_bytes()
+        self._authenticating = True
         try:
             if self._initiator:
                 await self._send_proof(my_keys, allowed[0])
-                self.verify_peer(my_public, allowed[0], await self.recv())
+                self.verify_peer(my_public, allowed[0], await self._recv())
                 return allowed[0]
-            proof = await self.recv()
+            proof = await self._recv()
             for candidate in allowed:
                 try:
                     self.verify_peer(my_public, candidate, proof)
@@ -281,10 +303,12 @@ class SecureChannel:
             self._usable = False
             self._writer.close()  # tell the peer right away instead of letting it time out
             raise
+        finally:
+            self._authenticating = False
 
     async def _send_proof(self, my_keys: KeyPair, peer_public_bytes: bytes) -> None:
         proof = await asyncio.to_thread(self.sign_session, my_keys, peer_public_bytes)
-        await self.send(proof)
+        await self._send(proof)
 
     async def close(self) -> None:
         self._usable = False

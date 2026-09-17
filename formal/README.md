@@ -109,8 +109,10 @@ Read these before you rely on a result.
 - **Only the first frames.** Per direction the model covers counter 0 and 1. It does
   not cover longer streams, the length field and 8 MiB limit, truncation (a known
   limitation), nonce exhaustion or the fail-closed channel state.
-- **Concurrency rules are assumed.** The requirement that nothing else uses the
-  channel until `authenticate()` returns is taken as given.
+- **Exclusive use during `authenticate()` is assumed.** The model takes it as
+  given that nothing else uses the channel until `authenticate()` returns. The
+  channel code enforces this, and `tests/test_channel.py` checks it, but the model
+  itself does not.
 - **Allowed keys.** The attacker picks which allowed key a responder checks. That
   choice is at least as strong as any real allow list.
 - **Secrecy is reachability secrecy** of the data sent. Indistinguishability
