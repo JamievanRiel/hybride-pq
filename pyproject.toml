@@ -9,7 +9,7 @@ description = "PBP-1: hybrid post-quantum signatures, encrypted channels and key
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Jamie" }]
+authors = [{ name = "Jamie van Riel" }]
 requires-python = ">=3.10"
 dependencies = [
     "cryptography>=50",
