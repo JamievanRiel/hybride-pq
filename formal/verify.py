@@ -43,6 +43,8 @@ QUERY_NAMES = {
     ("RespReceives", "InitSends"): "integrity_i2r",
     ("InitReceives", "RespSends"): "integrity_r2i",
     ("SigAccepted", "SigIssued"): "signature_separation",
+    ("InitConfirms", "RespDerives"): "key_confirmation_initiator",
+    ("RespConfirms", "InitDerives"): "key_confirmation_responder",
 }
 RESULT = re.compile(r"^RESULT (.*) (is true|is false|cannot be proved)\.$", re.MULTILINE)
 
@@ -122,6 +124,37 @@ MUTANTS = (
         ("integrity_i2r", "integrity_r2i"),
     ),
     Mutant(
+        "no key confirmation checks",
+        (
+            ("  if confirm_r = block_confirm_r(okm) then\n", ""),
+            ("  if confirm_i = block_confirm_i(okm) then\n", ""),
+        ),
+        frozenset(),
+        ("key_confirmation_initiator", "key_confirmation_responder"),
+    ),
+    Mutant(
+        "one confirmation value for both directions",
+        (
+            (
+                "fun block_confirm_i(bitstring): key.",
+                "letfun block_confirm_i(okm: bitstring) = block_confirm_r(okm).",
+            ),
+        ),
+        frozenset(),
+        ("key_confirmation_responder",),
+    ),
+    Mutant(
+        "confirmation value taken from a traffic key",
+        (
+            (
+                "fun block_confirm_r(bitstring): key.",
+                "letfun block_confirm_r(okm: bitstring) = block_key_r2i(okm).",
+            ),
+        ),
+        frozenset(),
+        ("secrecy_r2i", "integrity_r2i"),
+    ),
+    Mutant(
         "hybrid signature that only checks ML-DSA",
         (
             (
@@ -140,7 +173,9 @@ def claims(now: frozenset[str], later: frozenset[str]) -> dict[str, bool]:
 
     A forged signature only helps while sessions run, so later signature breaks
     change nothing (forward secrecy). Recorded traffic stays secret unless both
-    key exchanges fall, now or later.
+    key exchanges fall, now or later. Key confirmation needs the attacker to be
+    unable to compute the keys during the handshake, so it falls only when both
+    key exchanges are broken now.
     """
     signatures = not SIGNATURES <= now
     keys_now = not KEY_EXCHANGE <= now
@@ -151,6 +186,8 @@ def claims(now: frozenset[str], later: frozenset[str]) -> dict[str, bool]:
         "auth_initiator": signatures,
         "auth_responder": signatures,
         "signature_separation": signatures,
+        "key_confirmation_initiator": keys_now,
+        "key_confirmation_responder": keys_now,
         "secrecy_i2r": signatures and keys_ever,
         "secrecy_r2i": signatures and keys_ever,
         "integrity_i2r": signatures and keys_now,

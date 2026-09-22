@@ -1,10 +1,11 @@
 (* PBP-1 secure channel: a symbolic model for ProVerif 2.05.
 
    Covers docs/PROTOCOL.md section 4: the hybrid X25519 + ML-KEM-768 handshake
-   and key schedule (4.1), the first ChaCha20-Poly1305 frame in each direction
-   (4.2) and session binding with hybrid session proofs (4.4). Ordinary sign()
-   signatures (section 3) are in the model as well, because an application may
-   hand them out freely next to a channel.
+   (version 2, "PBP1N2") with its key schedule and key confirmation (4.1), the
+   first ChaCha20-Poly1305 frame in each direction (4.2) and session binding
+   with hybrid session proofs (4.4). Ordinary sign() signatures (section 3) are
+   in the model as well, because an application may hand them out freely next
+   to a channel.
 
    This file holds no process. formal/verify.py supplies one, of the form
    "process System(...)", whose arguments decide which primitives the attacker
@@ -18,11 +19,11 @@ free c: channel.
 (* Every field in a PBP-1 handshake message and session proof has a fixed
    length, so those byte strings parse in exactly one way. That justifies
    modelling them as tuples. *)
-const MAGIC: bitstring.          (* "PBP1N1", also the AEAD associated data *)
-const INFO_DOMAIN: bitstring.    (* "PBP1.net.v1" *)
+const MAGIC: bitstring.          (* "PBP1N2", also the AEAD associated data *)
+const INFO_DOMAIN: bitstring.    (* "PBP1.net.v2" *)
 const AUTH_DOMAIN: bitstring.    (* "PBP1.auth.v1" || 0x00 *)
-const ROLE_I: bitstring.         (* "I" *)
-const ROLE_R: bitstring.         (* "R" *)
+const ROLE_I: bitstring.         (* "I", in hello_i and in the initiator's proof *)
+const ROLE_R: bitstring.         (* "R", in hello_r and in the responder's proof *)
 const AUTH_CONTEXT: bitstring.   (* FIPS 204/205 context string "PBP1.auth.v1" *)
 const EMPTY_CONTEXT: bitstring.  (* the context string of ordinary sign() *)
 
@@ -57,10 +58,13 @@ type key.
    separate arguments, so computing the output takes both of them: this is the
    assumption that HKDF-SHA3-256 is a sound combiner (README "Security levels"). *)
 fun hkdf(G, bitstring, bitstring): bitstring.
-(* out[0:32], out[32:64], out[64:96]: knowing one block reveals no other. *)
+(* out[0:32], out[32:64], out[64:96], out[96:128], out[128:160]: knowing one
+   block reveals no other. The two confirmation values travel in the clear. *)
 fun block_key_i2r(bitstring): key.
 fun block_key_r2i(bitstring): key.
 fun block_session_id(bitstring): bitstring.
+fun block_confirm_r(bitstring): key.
+fun block_confirm_i(bitstring): key.
 fun sha3(bitstring): bitstring.
 
 (* ------------------------------------------------------- ChaCha20-Poly1305 *)
@@ -125,6 +129,13 @@ letfun verify_proof(pk: bitstring, m: bitstring, s: bitstring) = hybrid_verify(p
 
 (* ------------------------------------------------------------------ events *)
 
+(* Key confirmation. Arguments: hello_i, hello_r, key i->r, key r->i. *)
+event InitSendsHello(bitstring).
+event RespSendsHello(bitstring).
+event InitDerives(bitstring, bitstring, key, key).
+event RespDerives(bitstring, bitstring, key, key).
+event InitConfirms(bitstring, bitstring, key, key).
+event RespConfirms(bitstring, bitstring, key, key).
 (* Arguments: initiator key, responder key, session id, key i->r, key r->i. *)
 event InitProves(bitstring, bitstring, bitstring, key, key).
 event InitAccepts(bitstring, bitstring, bitstring, key, key).
@@ -150,6 +161,16 @@ query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
   event(InitReceives(pkI, pkR, session, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
 query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
   event(RespReceives(pkI, pkR, session, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
+
+(* Key confirmation: when a side finishes the handshake and the peer's hello
+   reached it unchanged, that peer derived the same keys from the same
+   transcript. So a change to a side's own hello on its way to the peer is
+   caught before the handshake ends. It is not authentication: the attacker can
+   be the peer. The queries below are about who the peer is. *)
+query hi: bitstring, hr: bitstring, k1: key, k2: key;
+  event(InitConfirms(hi, hr, k1, k2)) && event(RespSendsHello(hr)) ==> event(RespDerives(hi, hr, k1, k2)).
+query hi: bitstring, hr: bitstring, k1: key, k2: key;
+  event(RespConfirms(hi, hr, k1, k2)) && event(InitSendsHello(hi)) ==> event(InitDerives(hi, hr, k1, k2)).
 
 (* Mutual authentication with key agreement: an initiator that accepts an honest
    responder key is matched by exactly one responder session with that key, which
@@ -192,14 +213,20 @@ let Initiator(a: sk_mldsa, b: sk_slh, pkI: bitstring) =
   in(c, pkR: bitstring);
   new xi: exponent;
   new d: dk;
-  let hello_i = (MAGIC, exp(g, xi), mlkem_ek(d)) in
+  let hello_i = (MAGIC, ROLE_I, exp(g, xi), mlkem_ek(d)) in
+  event InitSendsHello(hello_i);
   out(c, hello_i);
-  in(c, hello_r: bitstring);
-  let (=MAGIC, Xr: G, ct: bitstring) = hello_r in
+  in(c, (hello_r: bitstring, confirm_r: key));
+  let (=MAGIC, =ROLE_R, Xr: G, ct: bitstring) = hello_r in
   let okm = derive(exp(Xr, xi), mlkem_decaps(d, ct), hello_i, hello_r) in
   let ki2r = block_key_i2r(okm) in
   let kr2i = block_key_r2i(okm) in
   let session = block_session_id(okm) in
+  (* key confirmation *)
+  if confirm_r = block_confirm_r(okm) then
+  event InitConfirms(hello_i, hello_r, ki2r, kr2i);
+  event InitDerives(hello_i, hello_r, ki2r, kr2i);
+  out(c, block_confirm_i(okm));
   (* authenticate(): the initiator proves first *)
   event InitProves(pkI, pkR, session, ki2r, kr2i);
   out(c, aead_enc(ki2r, N0, sign_proof(a, b, proof_message(ROLE_I, session, pkI, pkR)), MAGIC));
@@ -219,15 +246,21 @@ let Initiator(a: sk_mldsa, b: sk_slh, pkI: bitstring) =
 
 let Responder(a: sk_mldsa, b: sk_slh, pkR: bitstring) =
   in(c, hello_i: bitstring);
-  let (=MAGIC, Xi: G, ek: bitstring) = hello_i in
+  let (=MAGIC, =ROLE_I, Xi: G, ek: bitstring) = hello_i in
   new r: coins;
   new xr: exponent;
-  let hello_r = (MAGIC, exp(g, xr), mlkem_ct(ek, r)) in
-  out(c, hello_r);
+  let hello_r = (MAGIC, ROLE_R, exp(g, xr), mlkem_ct(ek, r)) in
   let okm = derive(exp(Xi, xr), mlkem_ss(ek, r), hello_i, hello_r) in
   let ki2r = block_key_i2r(okm) in
   let kr2i = block_key_r2i(okm) in
   let session = block_session_id(okm) in
+  event RespDerives(hello_i, hello_r, ki2r, kr2i);
+  event RespSendsHello(hello_r);
+  out(c, (hello_r, block_confirm_r(okm)));
+  (* key confirmation *)
+  in(c, confirm_i: key);
+  if confirm_i = block_confirm_i(okm) then
+  event RespConfirms(hello_i, hello_r, ki2r, kr2i);
   in(c, frame: bitstring);
   let proof_i = aead_dec(ki2r, N0, frame, MAGIC) in
   (* The allowed initiator key the proof matched. Any key may be on the allow

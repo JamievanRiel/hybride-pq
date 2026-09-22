@@ -21,7 +21,7 @@ python formal/verify.py --jobs 4
 ```
 
 The script finds `proverif` on `PATH`, in `~/.opam/default/bin`, or through the
-`PROVERIF` environment variable. A full run needs about 45 CPU minutes, which took
+`PROVERIF` environment variable. A full run needs about 40 CPU minutes, which took
 about 5 minutes on 12 threads. It exits with status 1 if any result differs from
 the claims below. The ProVerif output of a failed run is kept in a temporary
 directory, and the script prints its path.
@@ -34,8 +34,8 @@ every change to `formal/`, to `docs/PROTOCOL.md` or to the workflow itself.
 
 | Part | Model |
 |---|---|
-| Handshake (4.1) | `hello_i`, `hello_r`, X25519 as Diffie-Hellman, ML-KEM-768 with implicit rejection, HKDF over both shared secrets and the full transcript |
-| Frames (4.2) | ChaCha20-Poly1305 with separate keys per direction, counter 0 (session proof) and counter 1 (first application message), `"PBP1N1"` as associated data |
+| Handshake (4.1) | Version 2: `hello_i` and `hello_r` with their role byte, X25519 as Diffie-Hellman, ML-KEM-768 with implicit rejection, HKDF over both shared secrets and the full transcript, and key confirmation with two more HKDF blocks (`confirm_r`, `confirm_i`) sent in the clear |
+| Frames (4.2) | ChaCha20-Poly1305 with separate keys per direction, counter 0 (session proof) and counter 1 (first application message), `"PBP1N2"` as associated data |
 | Session binding (4.4) | `authenticate()`: the initiator proves first, the responder verifies against an allowed key and then proves, with role byte, session id, both fingerprints and the context string `"PBP1.auth.v1"` |
 | Signatures (3) | ML-DSA-65 **and** SLH-DSA, both must verify. Next to the channel, every honest key also signs *any* message the attacker asks for with ordinary `sign()` |
 
@@ -47,6 +47,8 @@ will also connect to keys that the attacker made.
 
 | Query | Meaning |
 |---|---|
+| `key_confirmation_initiator` | If an initiator finishes the handshake and the responder's hello reached it unchanged, that responder derived the same keys from the same transcript. So a change to `hello_i` on its way is caught before `initiate()` returns. |
+| `key_confirmation_responder` | The same for a responder whose initiator's hello reached it unchanged. A change to `hello_r` is caught before `respond()` returns. |
 | `auth_initiator` | If an initiator accepts an honest responder key, exactly one responder session with that key accepted the same initiator key, session id and traffic keys (injective agreement). |
 | `auth_responder` | The same in the other direction, for a responder that accepts an honest initiator key. |
 | `secrecy_i2r`, `secrecy_r2i` | Data sent after `authenticate()` to an honest peer stays secret. This includes an attacker who records everything and breaks more later. |
@@ -72,6 +74,10 @@ combinations broken later. For each one it expects exactly this:
   Breaking signatures later changes nothing: that is forward secrecy.
 - **Integrity** holds unless both signatures are broken now, or both key exchanges
   are broken now.
+- **Key confirmation** holds unless X25519 **and** ML-KEM are both broken now. An
+  attacker who can compute the keys can also compute the confirmation values.
+  Signatures play no part in it: key confirmation catches tampering, not
+  impersonation.
 
 A mismatch in either direction fails the run. So an attack that the claims say is
 impossible fails it, and so does a property that holds where the claims say it
@@ -92,6 +98,9 @@ attack trace. That shows the element is needed, and that the model is able to fa
 | X25519 from the key derivation | ML-KEM broken | Traffic readable and forgeable |
 | Separate traffic key per direction | nothing broken | A frame reflected back to its sender is accepted as the peer's message |
 | Frame counter in the nonce | nothing broken | The initiator's session proof, replayed, is accepted as application data |
+| Key confirmation checks | nothing broken | Both sides finish a handshake that was changed in transit |
+| Separate confirmation value per direction | nothing broken | `confirm_r`, reflected back to the responder, passes as `confirm_i` |
+| Key separation of the confirmation values | nothing broken | With `confirm_r` equal to the traffic key r→i, that traffic is readable and forgeable |
 | SLH-DSA check in hybrid verify | ML-DSA broken | Forged session proofs and signatures |
 
 ## What the model does not cover
@@ -111,6 +120,12 @@ Read these before you rely on a result.
 - **Only the first frames.** Per direction the model covers counter 0 and 1. It does
   not cover longer streams, the length field and 8 MiB limit, truncation (a known
   limitation), nonce exhaustion or the fail-closed channel state.
+- **Key confirmation assumes that one hello arrived unchanged.** Each query covers a
+  handshake in which the peer's hello arrived unchanged. No query covers an attacker
+  who changes *both* hellos without knowing the keys. The stronger statement, that
+  the peer derived the same keys or the attacker knows them, needs `attacker(k1)` in
+  the conclusion. ProVerif did not finish that version: after 11 minutes and 4.5 GB on
+  a single scenario it was stopped.
 - **Exclusive use during `authenticate()` is assumed.** The model takes it as
   given that nothing else uses the channel until `authenticate()` returns. The
   channel code enforces this, and `tests/test_channel.py` checks it, but the model
