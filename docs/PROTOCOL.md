@@ -121,8 +121,12 @@ proof = "PBP1" ‖ 0x01 ‖ ML-DSA-65.Sign(sk_A, proof_message, ctx = "PBP1.auth
   proof as one frame, naming the one responder key it expects. The responder checks it
   against each allowed initiator key and, only if one matches, sends its own proof
   (naming that key) as one frame. The initiator verifies that one.
-- Callers MUST NOT send or receive anything else on the channel, from any task, until
-  `authenticate` has returned. Nothing in the channel enforces this.
+- Nothing else may be sent or received on the channel, from any task, until
+  `authenticate` has returned, and the channel enforces this. `authenticate` raises
+  `ChannelError` if a frame was already sent or received, if a `recv` is pending, or
+  if another `authenticate` is running. While `authenticate` runs, `send` and `recv`
+  raise `ChannelError`. These refusals happen before any I/O and leave the channel
+  as it was.
 - Any failure inside `authenticate` makes the channel unusable and closes the transport.
   A failed `verify_peer` on its own does neither, so custom flows can try several keys.
   They MUST close the channel themselves if no key matches.

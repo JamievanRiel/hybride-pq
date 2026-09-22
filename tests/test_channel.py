@@ -324,3 +324,67 @@ def test_session_proofs_and_ordinary_signatures_never_mix(alice, bob):
         b.verify_peer(bob.public_bytes(), alice.public_bytes(), proof)
 
     _run(scenario)
+
+
+def test_recv_refused_while_authenticate_runs(alice, bob):
+    async def scenario(net):
+        a, b = await net.channels()
+        auth_b = asyncio.create_task(b.authenticate(bob, alice.public_bytes()))
+        await asyncio.sleep(0)  # b now waits for the initiator's proof
+        with pytest.raises(ChannelError, match="authenticate is running"):
+            await asyncio.wait_for(b.recv(), 2)
+        await a.authenticate(alice, bob.public_bytes())
+        await auth_b
+
+    _run(scenario)
+
+
+def test_send_refused_while_authenticate_runs(alice, bob):
+    async def scenario(net):
+        a, b = await net.channels()
+        auth_b = asyncio.create_task(b.authenticate(bob, alice.public_bytes()))
+        await asyncio.sleep(0)
+        with pytest.raises(ChannelError, match="authenticate is running"):
+            await b.send(b"would arrive where the initiator expects a proof")
+        await a.authenticate(alice, bob.public_bytes())
+        await auth_b
+
+    _run(scenario)
+
+
+def test_authenticate_refused_after_the_channel_carried_data(alice, bob):
+    async def scenario(net):
+        a, b = await net.channels()
+        await a.send(b"too early")
+        assert await b.recv() == b"too early"
+        with pytest.raises(ChannelError, match="directly after the handshake"):
+            await asyncio.wait_for(a.authenticate(alice, bob.public_bytes()), 2)
+        with pytest.raises(ChannelError, match="directly after the handshake"):
+            await asyncio.wait_for(b.authenticate(bob, alice.public_bytes()), 2)
+
+    _run(scenario)
+
+
+def test_authenticate_refused_while_a_recv_is_pending(alice, bob):
+    async def scenario(net):
+        a, b = await net.channels()
+        reader = asyncio.create_task(b.recv())  # would swallow the initiator's proof
+        await asyncio.sleep(0)
+        with pytest.raises(ChannelError, match="directly after the handshake"):
+            await asyncio.wait_for(b.authenticate(bob, alice.public_bytes()), 2)
+        reader.cancel()
+
+    _run(scenario)
+
+
+def test_authenticate_refused_while_another_authenticate_runs(alice, bob):
+    async def scenario(net):
+        a, b = await net.channels()
+        auth_a = asyncio.create_task(a.authenticate(alice, bob.public_bytes()))
+        await asyncio.sleep(0)  # a is still signing its proof: no frame, no lock yet
+        with pytest.raises(ChannelError, match="directly after the handshake"):
+            await asyncio.wait_for(a.authenticate(alice, bob.public_bytes()), 2)
+        await b.authenticate(bob, alice.public_bytes())
+        await auth_a
+
+    _run(scenario)

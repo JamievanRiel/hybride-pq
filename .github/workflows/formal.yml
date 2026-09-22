@@ -1,0 +1,42 @@
+name: formal model
+
+on:
+  push:
+    paths:
+      - "formal/**"
+      - "docs/PROTOCOL.md"
+      - ".github/workflows/formal.yml"
+  pull_request:
+    paths:
+      - "formal/**"
+      - "docs/PROTOCOL.md"
+      - ".github/workflows/formal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROVERIF_VERSION: "2.05"
+  PROVERIF_SHA256: "4871f53c32ab4a04669a060c4886ba5d9080496963fb980a9a62d2c429ceabc4"
+
+jobs:
+  proverif:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build ProVerif
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ocaml-nox
+          curl -fsSL -o "$RUNNER_TEMP/proverif.tar.gz" "https://proverif.inria.fr/proverif${PROVERIF_VERSION}.tar.gz"
+          echo "${PROVERIF_SHA256}  $RUNNER_TEMP/proverif.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/proverif.tar.gz" -C "$RUNNER_TEMP" --no-same-owner
+          cd "$RUNNER_TEMP/proverif${PROVERIF_VERSION}"
+          ./build -nointeract
+          echo "PROVERIF=$PWD/proverif" >> "$GITHUB_ENV"
+      - run: python formal/verify.py
