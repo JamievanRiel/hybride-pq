@@ -119,10 +119,13 @@ sequenceDiagram
     participant I as Initiator
     participant R as Responder
     Note over I: fresh X25519 key<br/>fresh ML-KEM-768 key
-    I->>R: hello_i = "PBP1N1" ‖ X25519 public ‖ ML-KEM public key
+    I->>R: hello_i = "PBP1N2" ‖ "I" ‖ X25519 public ‖ ML-KEM public key
     Note over R: fresh X25519 key<br/>encapsulate to ML-KEM key
-    R->>I: hello_r = "PBP1N1" ‖ X25519 public ‖ ML-KEM ciphertext
-    Note over I,R: ss_x = X25519 shared secret<br/>ss_k = ML-KEM shared secret<br/>keys = HKDF-SHA3-256(ss_x ‖ ss_k, "PBP1.net.v1" ‖ hello_i ‖ hello_r)
+    R->>I: hello_r = "PBP1N2" ‖ "R" ‖ X25519 public ‖ ML-KEM ciphertext, then confirm_r
+    Note over I,R: ss_x = X25519 shared secret<br/>ss_k = ML-KEM shared secret<br/>keys, session id, confirm_r, confirm_i =<br/>HKDF-SHA3-256(ss_x ‖ ss_k, "PBP1.net.v2" ‖ hello_i ‖ hello_r)
+    Note over I: check confirm_r
+    I->>R: confirm_i
+    Note over R: check confirm_i
     I-->>R: ChaCha20-Poly1305 frames (key i→r)
     R-->>I: ChaCha20-Poly1305 frames (key r→i)
 ```
@@ -137,7 +140,16 @@ today stays unreadable to a future quantum computer unless ML-KEM falls too (thr
 
 The derivation also includes **every byte of both hello messages** (the transcript).
 If an attacker changes a single handshake byte, the two sides end up with different
-keys, and the very first message fails to decrypt (threat 6).
+keys. **Key confirmation** catches that at once:
+- Next to the keys, the derivation produces two confirmation values, one per side.
+- Each side sends its value and checks the other's, so a tampered handshake fails
+  inside `initiate` or `respond`, before any message is sent (threat 6).
+- The values are separate blocks of the derivation, so they reveal nothing about the
+  keys.
+
+This catches tampering, not impersonation. A man in the middle who runs two separate
+handshakes holds the keys of both and confirms them correctly. Stopping that is the
+job of session binding (section 6).
 
 ### 4. Forward secrecy
 
@@ -235,7 +247,7 @@ random one. Six random words from the Diceware list give about 77 bits of entrop
 ### 9. Domain separation and strict parsing
 
 - **Every purpose gets its own label.** Signatures sign `"PBP1.sig.v1\0" ‖ message`,
-  key derivation uses `"PBP1.net.v1"`, and session proofs use their own context string
+  key derivation uses `"PBP1.net.v2"`, and session proofs use their own context string
   on top of their own label. A signature or key made for one of these purposes is never
   valid for another. The tests check this, and also that raw ML-DSA and SLH-DSA
   signatures over the bare message are rejected.
@@ -299,8 +311,10 @@ this library for anything.
 **Channel**
 
 8. **A bare channel does not know who is on the other end.** Without `authenticate` it
-   only stops eavesdroppers, not an active man in the middle. Authentication is only as
-   good as the way you learned the peer's public key.
+   only stops eavesdroppers, not an active man in the middle. Key confirmation in the
+   handshake does not change that: a man in the middle confirms both of its
+   handshakes. Authentication is only as good as the way you learned the peer's
+   public key.
 9. **Session binding has limits:**
    - Proofs are ordinary non-deniable signatures.
    - The initiator proves first, so an active attacker can see its proof and test it
@@ -315,15 +329,17 @@ this library for anything.
    - If you build your own flow from `sign_session` and `verify_peer`: a failed
      `verify_peer` does *not* close the channel. Close it yourself when no key matches.
 10. **Metadata is visible.** Message sizes (there is no padding), timing, who talks to
-    whom, and the fact that PBP-1 is used at all (a plaintext `PBP1N1` magic and fixed
+    whom, and the fact that PBP-1 is used at all (a plaintext `PBP1N2` magic and fixed
     handshake sizes) can all be observed.
 11. **Truncation.** An attacker can cut the connection. Every message you *did* receive
     is genuine and in order, but a closed connection does not prove the sender was
     finished. If that matters, send an explicit "done" message.
-12. **Clumsy failures.** There is no explicit key confirmation. A tampered handshake,
-    or two programs that both chose the same role, only shows up at the first `recv`,
-    sometimes with a confusing message such as "frame too large". Two responders wait
-    for each other until a timeout.
+12. **Two responders wait for each other.** If both programs chose the responder role,
+    each waits for a hello that never comes, until a timeout. The other mix-ups fail at
+    once with a clear error:
+    - key confirmation catches a tampered handshake inside `initiate` or `respond`;
+    - two initiators see each other's role byte;
+    - a peer that speaks the old `PBP1N1` handshake gets a version error.
 13. **Denial of service.** Apart from the 8 MiB frame limit, nothing is rate-limited.
     The handshake and `authenticate` have no built-in timeout, so wrap them in
     `asyncio.wait_for`. Cancelling a pending `recv` ends the channel. There's no
@@ -463,7 +479,7 @@ such as passing a `str` where `bytes` are expected, raise the usual `TypeError`.
 | Public key | 1 989 B | `"PBP1"` ‖ `0x01` ‖ ML-DSA pk (1952) ‖ SLH-DSA pk (32) |
 | Secret key | 101 B | `"PBP1"` ‖ `0x01` ‖ ML-DSA seed (32) ‖ SLH-DSA sk (64) |
 | Signature / session proof | 11 170 B | `"PBP1"` ‖ `0x01` ‖ ML-DSA sig (3309) ‖ SLH-DSA sig (7856) |
-| Handshake | 1 222 B + 1 126 B | see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) |
+| Handshake | 1 223 B + 1 159 B + 32 B | see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) |
 | Channel overhead | 20 B per message | 4-byte length + 16-byte tag |
 
 Measured on a 12th-gen Intel Core i5-12450H laptop with Python 3.14 (medians):
@@ -486,30 +502,34 @@ The trade-off is intentional: signatures are big and slow to create, but verifyi
 .venv/bin/pytest
 ```
 
-The suite has 88 tests and runs in about 17 seconds. Among other things it covers:
+The suite has 96 tests and runs in about 17 seconds. Among other things it covers:
 
 - **Signatures:** round trips, tampering with each half separately, mixing halves from
   different signatures, missing domain separation, and malformed encodings.
 - **Keystore:** tampering in every field, out-of-spec files, and file permissions.
-- **Channel:** replayed, reordered and forged frames, cancelled receives, a simulated
-  man in the middle, proofs that are reflected, meant for another peer, or swapped
-  with ordinary signatures, a server choosing among several allowed keys, and any
-  other use of the channel while `authenticate` runs.
+- **Channel:** tampered handshakes, two initiators, a peer with the old handshake,
+  replayed, reordered and forged frames, cancelled receives, a simulated man in the
+  middle, proofs that are reflected, meant for another peer, or swapped with ordinary
+  signatures, a server choosing among several allowed keys, and any other use of the
+  channel while `authenticate` runs.
 - **Formats:** the known-answer vectors.
 
 Continuous integration runs the suite on Python 3.10 to 3.14.
 
 The channel's design is also checked separately with a symbolic
-[ProVerif model](formal/README.md). It covers authentication, secrecy and integrity
-with any combination of primitives broken, now or later. This doesn't replace an
-independent review.
+[ProVerif model](formal/README.md). It covers key confirmation, authentication,
+secrecy and integrity with any combination of primitives broken, now or later. This
+doesn't replace an independent review.
 
 ## Origin, security reports and license
 
 hybride-pq is the cryptographic layer of **Pingobit**, an educational post-quantum
-cryptocurrency, published as a standalone library. Keys, signatures, keystore files
-and channel traffic are byte-for-byte compatible with Pingobit. Session binding
-(`session_id`, `authenticate`, `sign_session`, `verify_peer`) was added here.
+cryptocurrency, published as a standalone library. Keys, signatures and keystore
+files are byte-for-byte compatible with Pingobit. The channel was compatible up to
+version 0.1.0. Since 0.2.0 it uses handshake version 2 (`PBP1N2`, with key
+confirmation), which Pingobit's `PBP1N1` channel doesn't speak. Session binding
+(`session_id`, `authenticate`, `sign_session`, `verify_peer`) and key confirmation
+were added here.
 
 Found a weakness? Please report it privately, as described in [SECURITY.md](SECURITY.md).
 
