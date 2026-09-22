@@ -14,7 +14,15 @@ from cryptography.hazmat.primitives.asymmetric import mlkem, x25519
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from hybride_pq import KeyPair, keystore
-from hybride_pq.channel import AUTH_CONTEXT, MAGIC, _nonce, derive_keys, session_proof_message
+from hybride_pq.channel import (
+    AUTH_CONTEXT,
+    MAGIC,
+    ROLE_I,
+    ROLE_R,
+    _nonce,
+    derive_keys,
+    session_proof_message,
+)
 from hybride_pq.sign import _sign
 
 HERE = Path(__file__).parent
@@ -45,22 +53,23 @@ def _channel(path: Path) -> None:
     x_r = x25519.X25519PrivateKey.generate()
     kem_i = mlkem.MLKEM768PrivateKey.generate()
     ss_kem, ct = kem_i.public_key().encapsulate()
-    hello_i = MAGIC + x_i.public_key().public_bytes_raw() + kem_i.public_key().public_bytes_raw()
-    hello_r = MAGIC + x_r.public_key().public_bytes_raw() + ct
-    key_i2r, key_r2i, session_id = derive_keys(
-        x_i.exchange(x_r.public_key()), ss_kem, hello_i, hello_r
+    hello_i = (
+        MAGIC + ROLE_I + x_i.public_key().public_bytes_raw()
+        + kem_i.public_key().public_bytes_raw()
     )
+    hello_r = MAGIC + ROLE_R + x_r.public_key().public_bytes_raw() + ct
+    keys = derive_keys(x_i.exchange(x_r.public_key()), ss_kem, hello_i, hello_r)
     vector = {
         "x25519_sk_initiator": x_i.private_bytes_raw().hex(),
         "x25519_sk_responder": x_r.private_bytes_raw().hex(),
         "mlkem768_seed_initiator": kem_i.private_bytes_raw().hex(),
         "hello_i": hello_i.hex(),
         "hello_r": hello_r.hex(),
-        "key_i2r": key_i2r.hex(),
-        "key_r2i": key_r2i.hex(),
-        "session_id": session_id.hex(),
+        **{name: value.hex() for name, value in keys._asdict().items()},
         "frame0_plaintext": FRAME_PLAINTEXT.hex(),
-        "frame0_i2r": ChaCha20Poly1305(key_i2r).encrypt(_nonce(0), FRAME_PLAINTEXT, MAGIC).hex(),
+        "frame0_i2r": ChaCha20Poly1305(keys.key_i2r).encrypt(
+            _nonce(0), FRAME_PLAINTEXT, MAGIC
+        ).hex(),
     }
     path.write_text(json.dumps(vector, indent=2) + "\n")
 
@@ -68,7 +77,7 @@ def _channel(path: Path) -> None:
 def _session_proof(path: Path) -> None:
     initiator = KeyPair.from_secret_bytes(bytes.fromhex(SIGNATURE_VECTOR["secret_bytes"]))
     responder_public = KeyPair.generate().public_bytes()
-    session_id = bytes.fromhex(json.loads((HERE / "channel_v1.json").read_text())["session_id"])
+    session_id = bytes.fromhex(json.loads((HERE / "channel_v2.json").read_text())["session_id"])
     message = session_proof_message(True, session_id, initiator.public_bytes(), responder_public)
     vector = {
         "session_id": session_id.hex(),
@@ -82,5 +91,5 @@ def _session_proof(path: Path) -> None:
 
 
 _write("keystore_v1.json", _keystore)
-_write("channel_v1.json", _channel)
+_write("channel_v2.json", _channel)
 _write("session_proof_v1.json", _session_proof)

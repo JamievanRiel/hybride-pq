@@ -1,12 +1,16 @@
 """Encrypted connection: hybrid X25519 + ML-KEM-768 handshake, ChaCha20-Poly1305 frames.
 
-The handshake alone is *unauthenticated*: it stops eavesdroppers, not an active
+The handshake (PBP1N2) ends with key confirmation, so a tampered handshake fails
+before :meth:`SecureChannel.initiate` or :meth:`SecureChannel.respond` returns.
+It is still *unauthenticated*: it stops eavesdroppers, not an active
 man in the middle. Call :meth:`SecureChannel.authenticate` to bind known signing
 keys to the connection.
 """
 
 import asyncio
+import hmac
 from collections.abc import Iterable
+from typing import NamedTuple
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -19,8 +23,11 @@ from .hashing import sha3_256
 from .keys import KeyPair
 from .sign import _sign, _verify
 
-MAGIC = b"PBP1N1"
-INFO_DOMAIN = b"PBP1.net.v1"
+MAGIC = b"PBP1N2"
+_V1_MAGIC = b"PBP1N1"  # only recognised to name the mismatch
+INFO_DOMAIN = b"PBP1.net.v2"
+ROLE_I = b"I"
+ROLE_R = b"R"
 AUTH_DOMAIN = b"PBP1.auth.v1\x00"
 # FIPS 204/205 context string: session proofs can never be ordinary signatures.
 AUTH_CONTEXT = b"PBP1.auth.v1"
@@ -30,8 +37,10 @@ MAX_MESSAGE = MAX_FRAME - TAG_SIZE
 X25519_SIZE = 32
 MLKEM_EK_SIZE = 1184
 MLKEM_CT_SIZE = 1088
-HELLO_I_SIZE = len(MAGIC) + X25519_SIZE + MLKEM_EK_SIZE
-HELLO_R_SIZE = len(MAGIC) + X25519_SIZE + MLKEM_CT_SIZE
+CONFIRM_SIZE = 32
+_HEADER_SIZE = len(MAGIC) + len(ROLE_I)
+HELLO_I_SIZE = _HEADER_SIZE + X25519_SIZE + MLKEM_EK_SIZE
+HELLO_R_SIZE = _HEADER_SIZE + X25519_SIZE + MLKEM_CT_SIZE
 _MAX_COUNTER = 2**64 - 1
 
 
@@ -56,22 +65,50 @@ def _nonce(counter: int) -> bytes:
     return bytes(4) + counter.to_bytes(8, "big")
 
 
-def derive_keys(
-    ss_x25519: bytes, ss_mlkem: bytes, hello_i: bytes, hello_r: bytes
-) -> tuple[bytes, bytes, bytes]:
-    """Turn both shared secrets and the full transcript into session keys.
+class SessionKeys(NamedTuple):
+    key_i2r: bytes
+    key_r2i: bytes
+    session_id: bytes
+    confirm_r: bytes
+    confirm_i: bytes
 
-    Returns ``(key initiator->responder, key responder->initiator, session_id)``.
-    HKDF output blocks do not depend on the requested length, so the two traffic
-    keys (bytes 0..64) are the same as in Pingobit, which derives only 64 bytes.
+
+def derive_keys(ss_x25519: bytes, ss_mlkem: bytes, hello_i: bytes, hello_r: bytes) -> SessionKeys:
+    """Turn both shared secrets and the full transcript into five 32-byte blocks.
+
+    Two traffic keys, the session id, and the values the responder and the
+    initiator send to show they derived the same keys. Knowing one block
+    reveals no other, so the confirmation values can travel in the clear.
     """
     out = HKDF(
         algorithm=hashes.SHA3_256(),
-        length=96,
+        length=160,
         salt=None,
         info=INFO_DOMAIN + hello_i + hello_r,
     ).derive(ss_x25519 + ss_mlkem)
-    return out[:32], out[32:64], out[64:]
+    return SessionKeys(*(out[i : i + 32] for i in range(0, 160, 32)))
+
+
+async def _read_hello(reader, expected_role: bytes, size: int) -> bytes:
+    """Read the peer's hello, checking magic and role before waiting for the rest."""
+    header = await _read_exact(reader, _HEADER_SIZE)
+    magic, role = header[: len(MAGIC)], header[len(MAGIC) :]
+    if magic == _V1_MAGIC:
+        raise ChannelError("handshake: the peer speaks PBP1N1; this library speaks PBP1N2")
+    if magic != MAGIC:
+        raise ChannelError("handshake: wrong magic; the peer does not speak PBP1N2")
+    if role != expected_role:
+        if role == ROLE_I:
+            raise ChannelError("handshake: the peer is also an initiator; one side must respond")
+        raise ChannelError("handshake: unexpected role byte from the peer")
+    return header + await _read_exact(reader, size - _HEADER_SIZE)
+
+
+def _check_confirmation(received: bytes, expected: bytes) -> None:
+    if not hmac.compare_digest(received, expected):
+        raise ChannelError(
+            "handshake: key confirmation failed (tampered handshake, or the peer derived other keys)"
+        )
 
 
 def session_proof_message(
@@ -84,7 +121,7 @@ def session_proof_message(
     """
     return (
         AUTH_DOMAIN
-        + (b"I" if signer_is_initiator else b"R")
+        + (ROLE_I if signer_is_initiator else ROLE_R)
         + session_id
         + sha3_256(signer_public)
         + sha3_256(peer_public)
@@ -123,54 +160,63 @@ class SecureChannel:
 
     @classmethod
     async def initiate(cls, reader, writer) -> "SecureChannel":
-        x_sk = x25519.X25519PrivateKey.generate()
-        kem_sk = mlkem.MLKEM768PrivateKey.generate()
-        hello_i = (
-            MAGIC
-            + x_sk.public_key().public_bytes_raw()
-            + kem_sk.public_key().public_bytes_raw()
-        )
-        await _write(writer, hello_i)
-        hello_r = await _read_exact(reader, HELLO_R_SIZE)
-        if hello_r[: len(MAGIC)] != MAGIC:
-            raise ChannelError("handshake: wrong magic from responder")
         try:
-            peer_x = x25519.X25519PublicKey.from_public_bytes(
-                hello_r[len(MAGIC) : len(MAGIC) + X25519_SIZE]
+            x_sk = x25519.X25519PrivateKey.generate()
+            kem_sk = mlkem.MLKEM768PrivateKey.generate()
+            hello_i = (
+                MAGIC + ROLE_I
+                + x_sk.public_key().public_bytes_raw()
+                + kem_sk.public_key().public_bytes_raw()
             )
-            ss_x = x_sk.exchange(peer_x)
-            ss_kem = kem_sk.decapsulate(hello_r[len(MAGIC) + X25519_SIZE :])
-        except ValueError as e:
-            raise ChannelError(f"handshake failed: {e}") from None
-        key_i2r, key_r2i, session_id = derive_keys(ss_x, ss_kem, hello_i, hello_r)
+            await _write(writer, hello_i)
+            hello_r = await _read_hello(reader, ROLE_R, HELLO_R_SIZE)
+            try:
+                peer_x = x25519.X25519PublicKey.from_public_bytes(
+                    hello_r[_HEADER_SIZE : _HEADER_SIZE + X25519_SIZE]
+                )
+                ss_x = x_sk.exchange(peer_x)
+                ss_kem = kem_sk.decapsulate(hello_r[_HEADER_SIZE + X25519_SIZE :])
+            except ValueError as e:
+                raise ChannelError(f"handshake failed: {e}") from None
+            keys = derive_keys(ss_x, ss_kem, hello_i, hello_r)
+            _check_confirmation(await _read_exact(reader, CONFIRM_SIZE), keys.confirm_r)
+            await _write(writer, keys.confirm_i)
+        except BaseException:
+            writer.close()  # tell the peer right away instead of letting it time out
+            raise
         return cls(
             reader, writer,
-            send_key=key_i2r, recv_key=key_r2i, session_id=session_id, initiator=True,
+            send_key=keys.key_i2r, recv_key=keys.key_r2i, session_id=keys.session_id,
+            initiator=True,
         )
 
     @classmethod
     async def respond(cls, reader, writer) -> "SecureChannel":
-        hello_i = await _read_exact(reader, HELLO_I_SIZE)
-        if hello_i[: len(MAGIC)] != MAGIC:
-            raise ChannelError("handshake: wrong magic from initiator")
         try:
-            peer_x = x25519.X25519PublicKey.from_public_bytes(
-                hello_i[len(MAGIC) : len(MAGIC) + X25519_SIZE]
-            )
-            peer_ek = mlkem.MLKEM768PublicKey.from_public_bytes(
-                hello_i[len(MAGIC) + X25519_SIZE :]
-            )
-            ss_kem, ct = peer_ek.encapsulate()
-            x_sk = x25519.X25519PrivateKey.generate()
-            ss_x = x_sk.exchange(peer_x)
-        except ValueError as e:
-            raise ChannelError(f"handshake failed: {e}") from None
-        hello_r = MAGIC + x_sk.public_key().public_bytes_raw() + ct
-        await _write(writer, hello_r)
-        key_i2r, key_r2i, session_id = derive_keys(ss_x, ss_kem, hello_i, hello_r)
+            hello_i = await _read_hello(reader, ROLE_I, HELLO_I_SIZE)
+            try:
+                peer_x = x25519.X25519PublicKey.from_public_bytes(
+                    hello_i[_HEADER_SIZE : _HEADER_SIZE + X25519_SIZE]
+                )
+                peer_ek = mlkem.MLKEM768PublicKey.from_public_bytes(
+                    hello_i[_HEADER_SIZE + X25519_SIZE :]
+                )
+                ss_kem, ct = peer_ek.encapsulate()
+                x_sk = x25519.X25519PrivateKey.generate()
+                ss_x = x_sk.exchange(peer_x)
+            except ValueError as e:
+                raise ChannelError(f"handshake failed: {e}") from None
+            hello_r = MAGIC + ROLE_R + x_sk.public_key().public_bytes_raw() + ct
+            keys = derive_keys(ss_x, ss_kem, hello_i, hello_r)
+            await _write(writer, hello_r + keys.confirm_r)
+            _check_confirmation(await _read_exact(reader, CONFIRM_SIZE), keys.confirm_i)
+        except BaseException:
+            writer.close()
+            raise
         return cls(
             reader, writer,
-            send_key=key_r2i, recv_key=key_i2r, session_id=session_id, initiator=False,
+            send_key=keys.key_r2i, recv_key=keys.key_i2r, session_id=keys.session_id,
+            initiator=False,
         )
 
     def _check_usable(self) -> None:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hybride-pq"
-version = "0.1.0"
+version = "0.2.0"
 description = "PBP-1: hybrid post-quantum signatures, encrypted channels and key storage from standardized primitives"
 readme = "README.md"
 license = "MIT"

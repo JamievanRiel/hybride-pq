@@ -14,7 +14,7 @@ from .hashing import sha3_256
 from .keys import KeyPair
 from .sign import sign, verify
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "ChannelError",

@@ -7,6 +7,7 @@ import pytest
 from hybride_pq.channel import (
     AUTH_CONTEXT,
     HELLO_I_SIZE,
+    HELLO_R_SIZE,
     MAGIC,
     MAX_MESSAGE,
     SecureChannel,
@@ -38,6 +39,7 @@ class _Net:
 
     def __init__(self):
         self._writers = []
+        self._tasks = []
 
     async def streams(self):
         s1, s2 = socket.socketpair()
@@ -54,7 +56,30 @@ class _Net:
             SecureChannel.initiate(r1, w1), SecureChannel.respond(r2, w2)
         )
 
+    async def relayed(self, flip_i2r=None, flip_r2i=None):
+        """Initiator and responder connected through a relay that can flip one bit.
+
+        ``flip_i2r``/``flip_r2i`` is the stream offset of the byte to change in that
+        direction. Returns the results of initiate and respond, exceptions included.
+        """
+        (ri, wi), (rx1, wx1) = await self.streams()
+        (rx2, wx2), (rr, wr) = await self.streams()
+        self._tasks += [
+            asyncio.create_task(_pump(rx1, wx2, flip_i2r)),
+            asyncio.create_task(_pump(rx2, wx1, flip_r2i)),
+        ]
+        return await asyncio.wait_for(
+            asyncio.gather(
+                SecureChannel.initiate(ri, wi),
+                SecureChannel.respond(rr, wr),
+                return_exceptions=True,
+            ),
+            5,
+        )
+
     async def close(self):
+        for task in self._tasks:
+            task.cancel()
         for writer in self._writers:
             writer.close()
             try:
@@ -78,6 +103,23 @@ async def _raw_frame(channel, counter, data):
     ct = channel._send_aead.encrypt(_nonce(counter), data, MAGIC)
     channel._writer.write(len(ct).to_bytes(4, "big") + ct)
     await channel._writer.drain()
+
+
+async def _pump(reader, writer, flip_at):
+    """Copy bytes until EOF, flipping the lowest bit of the byte at ``flip_at``."""
+    offset = 0
+    try:
+        while data := await reader.read(65536):
+            if flip_at is not None and offset <= flip_at < offset + len(data):
+                data = bytearray(data)
+                data[flip_at - offset] ^= 1
+            offset += len(data)
+            writer.write(bytes(data))
+            await writer.drain()
+    except OSError:
+        pass
+    finally:
+        writer.close()
 
 
 def test_messages_both_directions():
@@ -205,13 +247,83 @@ def test_closed_connection_raises():
     _run(scenario)
 
 
-def test_wrong_handshake_magic_rejected():
+def test_wrong_handshake_magic_rejected_and_transport_closed():
     async def scenario(net):
         (r1, w1), (r2, w2) = await net.streams()
         w1.write(b"XXXXXX" + bytes(HELLO_I_SIZE - 6))
         await w1.drain()
-        with pytest.raises(ChannelError):
+        with pytest.raises(ChannelError, match="wrong magic"):
             await SecureChannel.respond(r2, w2)
+        assert w2.is_closing()
+        assert await asyncio.wait_for(r1.read(), 2) == b""  # the peer sees EOF at once
+
+    _run(scenario)
+
+
+@pytest.mark.parametrize(
+    ("direction", "offset", "checker"),
+    [
+        ("i2r", 10, "initiator"),  # X25519 value in hello_i
+        ("r2i", 10, "initiator"),  # X25519 value in hello_r
+        ("r2i", 1000, "initiator"),  # ML-KEM ciphertext in hello_r
+        ("r2i", HELLO_R_SIZE + 5, "initiator"),  # confirm_r
+        ("i2r", HELLO_I_SIZE + 5, "responder"),  # confirm_i
+    ],
+)
+def test_tampered_handshake_fails_key_confirmation(direction, offset, checker):
+    async def scenario(net):
+        a, b = await net.relayed(**{f"flip_{direction}": offset})
+        if checker == "initiator":
+            assert isinstance(a, ChannelError) and "key confirmation" in str(a)
+            assert isinstance(b, ChannelError)  # the initiator hung up; b did not wait
+        else:
+            assert isinstance(b, ChannelError) and "key confirmation" in str(b)
+            with pytest.raises(ChannelError):
+                await asyncio.wait_for(a.recv(), 5)
+
+    _run(scenario)
+
+
+def test_untampered_relay_works():
+    async def scenario(net):
+        a, b = await net.relayed()
+        await a.send(b"through the relay")
+        assert await b.recv() == b"through the relay"
+
+    _run(scenario)
+
+
+def test_two_initiators_fail_at_once():
+    async def scenario(net):
+        (r1, w1), (r2, w2) = await net.streams()
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                SecureChannel.initiate(r1, w1),
+                SecureChannel.initiate(r2, w2),
+                return_exceptions=True,
+            ),
+            5,
+        )
+        for result in results:
+            assert isinstance(result, ChannelError) and "also an initiator" in str(result)
+
+    _run(scenario)
+
+
+def test_v1_peer_gets_a_version_error_not_a_hang():
+    async def scenario(net):
+        # a complete PBP1N1 hello_i is one byte shorter than a PBP1N2 one
+        (r1, w1), (r2, w2) = await net.streams()
+        w1.write(b"PBP1N1" + bytes(1222 - 6))
+        await w1.drain()
+        with pytest.raises(ChannelError, match="PBP1N1"):
+            await asyncio.wait_for(SecureChannel.respond(r2, w2), 2)
+        # and a PBP1N1 hello_r reaching a PBP1N2 initiator
+        (r3, w3), (r4, w4) = await net.streams()
+        w4.write(b"PBP1N1" + bytes(1126 - 6))
+        await w4.drain()
+        with pytest.raises(ChannelError, match="PBP1N1"):
+            await asyncio.wait_for(SecureChannel.initiate(r3, w3), 2)
 
     _run(scenario)
 

@@ -10,6 +10,8 @@ from hybride_pq import keystore
 from hybride_pq.channel import (
     AUTH_CONTEXT,
     MAGIC,
+    ROLE_I,
+    ROLE_R,
     X25519_SIZE,
     _nonce,
     derive_keys,
@@ -21,7 +23,7 @@ from hybride_pq.sign import _verify, sign, verify
 
 VECTORS = Path(__file__).parent / "vectors"
 SIG = json.loads((VECTORS / "signature_v1.json").read_text())
-CHANNEL = json.loads((VECTORS / "channel_v1.json").read_text())
+CHANNEL = json.loads((VECTORS / "channel_v2.json").read_text())
 PROOF = json.loads((VECTORS / "session_proof_v1.json").read_text())
 
 
@@ -62,18 +64,19 @@ def test_channel_handshake_derives_pinned_keys():
     x_r = x25519.X25519PrivateKey.from_private_bytes(_hex(CHANNEL, "x25519_sk_responder"))
     kem_i = mlkem.MLKEM768PrivateKey.from_seed_bytes(_hex(CHANNEL, "mlkem768_seed_initiator"))
     hello_i, hello_r = _hex(CHANNEL, "hello_i"), _hex(CHANNEL, "hello_r")
+    header = len(MAGIC) + len(ROLE_R)
 
     assert hello_i == (
-        MAGIC + x_i.public_key().public_bytes_raw() + kem_i.public_key().public_bytes_raw()
+        MAGIC + ROLE_I + x_i.public_key().public_bytes_raw()
+        + kem_i.public_key().public_bytes_raw()
     )
-    assert hello_r[: len(MAGIC) + X25519_SIZE] == MAGIC + x_r.public_key().public_bytes_raw()
+    assert hello_r[: header + X25519_SIZE] == MAGIC + ROLE_R + x_r.public_key().public_bytes_raw()
 
     ss_x = x_i.exchange(x_r.public_key())
-    ss_kem = kem_i.decapsulate(hello_r[len(MAGIC) + X25519_SIZE :])
-    key_i2r, key_r2i, session_id = derive_keys(ss_x, ss_kem, hello_i, hello_r)
-    assert key_i2r.hex() == CHANNEL["key_i2r"]
-    assert key_r2i.hex() == CHANNEL["key_r2i"]
-    assert session_id.hex() == CHANNEL["session_id"]
+    ss_kem = kem_i.decapsulate(hello_r[header + X25519_SIZE :])
+    keys = derive_keys(ss_x, ss_kem, hello_i, hello_r)
+    for name, value in keys._asdict().items():
+        assert value.hex() == CHANNEL[name], name
 
 
 def test_channel_first_frame_is_pinned():
@@ -85,7 +88,6 @@ def test_channel_first_frame_is_pinned():
 
 def test_session_proof_message_and_proof_are_pinned():
     assert PROOF["context"] == AUTH_CONTEXT.hex()
-    assert PROOF["session_id"] == CHANNEL["session_id"]
     message = session_proof_message(
         True,
         _hex(PROOF, "session_id"),
