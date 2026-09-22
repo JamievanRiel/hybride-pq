@@ -1,8 +1,9 @@
 """Encrypted connection: hybrid X25519 + ML-KEM-768 handshake, ChaCha20-Poly1305 frames.
 
-The handshake (PBP1N2) ends with key confirmation, so a tampered handshake fails
-before :meth:`SecureChannel.initiate` or :meth:`SecureChannel.respond` returns.
-It is still *unauthenticated*: it stops eavesdroppers, not an active
+The handshake (PBP1N2) ends with key confirmation, so a tampered handshake is
+caught by the handshake itself: the side that checks the changed value fails in
+:meth:`SecureChannel.initiate` or :meth:`SecureChannel.respond`, and the other side
+sees the connection close. It is still *unauthenticated*: it stops eavesdroppers, not an active
 man in the middle. Call :meth:`SecureChannel.authenticate` to bind known signing
 keys to the connection.
 """
@@ -72,6 +73,9 @@ class SessionKeys(NamedTuple):
     confirm_r: bytes
     confirm_i: bytes
 
+    def __repr__(self) -> str:
+        return "SessionKeys(<secret>)"  # keep traffic keys out of logs and tracebacks
+
 
 def derive_keys(ss_x25519: bytes, ss_mlkem: bytes, hello_i: bytes, hello_r: bytes) -> SessionKeys:
     """Turn both shared secrets and the full transcript into five 32-byte blocks.
@@ -91,7 +95,13 @@ def derive_keys(ss_x25519: bytes, ss_mlkem: bytes, hello_i: bytes, hello_r: byte
 
 async def _read_hello(reader, expected_role: bytes, size: int) -> bytes:
     """Read the peer's hello, checking magic and role before waiting for the rest."""
-    header = await _read_exact(reader, _HEADER_SIZE)
+    try:
+        header = await _read_exact(reader, _HEADER_SIZE)
+    except ChannelError:
+        raise ChannelError(
+            "handshake: the peer closed the connection before sending its hello "
+            "(it may have rejected ours, for example because it speaks PBP1N1)"
+        ) from None
     magic, role = header[: len(MAGIC)], header[len(MAGIC) :]
     if magic == _V1_MAGIC:
         raise ChannelError("handshake: the peer speaks PBP1N1; this library speaks PBP1N2")
@@ -160,6 +170,13 @@ class SecureChannel:
 
     @classmethod
     async def initiate(cls, reader, writer) -> "SecureChannel":
+        """Run the handshake as the side that connects.
+
+        Returns once the responder's key confirmation checked out. The
+        responder checks ours afterwards; if it rejects it, this side learns
+        that as a closed connection at its next ``recv``. On any failure,
+        including cancellation, the transport is closed.
+        """
         try:
             x_sk = x25519.X25519PrivateKey.generate()
             kem_sk = mlkem.MLKEM768PrivateKey.generate()
@@ -192,6 +209,11 @@ class SecureChannel:
 
     @classmethod
     async def respond(cls, reader, writer) -> "SecureChannel":
+        """Run the handshake as the side that accepts.
+
+        Returns once the initiator's key confirmation checked out. On any
+        failure, including cancellation, the transport is closed.
+        """
         try:
             hello_i = await _read_hello(reader, ROLE_I, HELLO_I_SIZE)
             try:

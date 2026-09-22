@@ -80,12 +80,20 @@ I → R: confirm_i                                                           =  
   them, and only then reads the rest. A peer that speaks another version or plays the
   same role is therefore refused at once, instead of leaving the receiver waiting for
   bytes that never come.
+  - A version-1 responder can't do the same. It rejects a version-2 `hello_i` without
+    answering. The version-2 initiator then sees the connection close before a hello
+    arrives, or waits until its timeout if that responder keeps the connection open.
+  - If the peer closes before its hello, the error says so and names a version-1 peer
+    as a possible cause.
 - **Key confirmation.**
   - The initiator compares `confirm_r` with its own value in constant time before it
     sends `confirm_i`. The responder compares `confirm_i` the same way before
     `respond` returns.
   - A mismatch means that the handshake was changed in transit, or that the peer
     derived other keys. It is a `ChannelError`.
+  - The initiator does not wait for the responder's check. Frames may follow
+    `confirm_i` on the stream at once. If the responder rejects `confirm_i`, the
+    initiator learns it only as a closed connection.
   - The five HKDF blocks are independent, so the confirmation values reveal nothing
     about the keys or the session id.
 - **Errors.** All of these are a `ChannelError`:
@@ -209,7 +217,8 @@ ciphertext = ChaCha20-Poly1305.Encrypt(key, nonce, secret, aad = version as ASCI
 ## 6. Agility
 
 A future algorithm set gets a new suite byte (keys and signatures), new domain labels
-and a new keystore version. Implementations MUST NOT guess: an unknown suite or
+and a new keystore version. The channel handshake carries its version in its magic
+(`"PBP1N2"` is version 2, see 4.1). Implementations MUST NOT guess: an unknown suite or
 version is an error, never a fallback.
 
 ## 7. Test vectors

@@ -142,8 +142,9 @@ The derivation also includes **every byte of both hello messages** (the transcri
 If an attacker changes a single handshake byte, the two sides end up with different
 keys. **Key confirmation** catches that at once:
 - Next to the keys, the derivation produces two confirmation values, one per side.
-- Each side sends its value and checks the other's, so a tampered handshake fails
-  inside `initiate` or `respond`, before any message is sent (threat 6).
+- Each side sends its value and checks the other's. The side that checks a changed
+  value fails inside `initiate` or `respond`, and the other side sees the connection
+  close (threat 6).
 - The values are separate blocks of the derivation, so they reveal nothing about the
   keys.
 
@@ -258,7 +259,8 @@ random one. Six random words from the Diceware list give about 77 bits of entrop
 ### 10. Built to be replaced and to be checked
 
 - **Crypto agility.** The suite byte and the versioned keystore format mean an algorithm
-  can be swapped for a new suite without making old data unreadable or ambiguous.
+  can be swapped for a new suite without making old data unreadable or ambiguous. The
+  channel carries its handshake version in its magic (`PBP1N2` since 0.2.0).
 - **Known-answer test vectors** in [`tests/vectors/`](tests/vectors) pin the formats of
   signatures, keystore files, the handshake key derivation, the frame encryption and
   the session proofs. An accidental change to any of them fails the test suite.
@@ -339,7 +341,14 @@ this library for anything.
     once with a clear error:
     - key confirmation catches a tampered handshake inside `initiate` or `respond`;
     - two initiators see each other's role byte;
-    - a peer that speaks the old `PBP1N1` handshake gets a version error.
+    - a responder refuses an initiator that speaks the old `PBP1N1` handshake with a
+      version error.
+
+    Mixed versions have one catch the other way round. A `PBP1N1` responder rejects
+    the new hello without answering. The `PBP1N2` initiator then sees the connection
+    close before any hello arrives, and the error says it may be a `PBP1N1` peer. If
+    that responder leaves the connection open, the initiator waits until its timeout.
+    Upgrade servers before clients.
 13. **Denial of service.** Apart from the 8 MiB frame limit, nothing is rate-limited.
     The handshake and `authenticate` have no built-in timeout, so wrap them in
     `asyncio.wait_for`. Cancelling a pending `recv` ends the channel. There's no
@@ -502,7 +511,7 @@ The trade-off is intentional: signatures are big and slow to create, but verifyi
 .venv/bin/pytest
 ```
 
-The suite has 96 tests and runs in about 17 seconds. Among other things it covers:
+The suite has 102 tests and runs in about 17 seconds. Among other things it covers:
 
 - **Signatures:** round trips, tampering with each half separately, mixing halves from
   different signatures, missing domain separation, and malformed encodings.

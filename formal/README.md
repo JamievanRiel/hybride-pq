@@ -121,7 +121,9 @@ Read these before you rely on a result.
   not cover longer streams, the length field and 8 MiB limit, truncation (a known
   limitation), nonce exhaustion or the fail-closed channel state.
 - **Key confirmation assumes that one hello arrived unchanged.** Each query covers a
-  handshake in which the peer's hello arrived unchanged. No query covers an attacker
+  handshake in which the peer's hello arrived unchanged. So it shows that a side
+  catches a change to its *own* hello on the way out. That a side catches a change
+  to the hello it *receives* is checked by `tests/test_channel.py`, not by a query. No query covers an attacker
   who changes *both* hellos without knowing the keys. The stronger statement, that
   the peer derived the same keys or the attacker knows them, needs `attacker(k1)` in
   the conclusion. ProVerif did not finish that version: after 11 minutes and 4.5 GB on

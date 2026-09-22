@@ -80,6 +80,9 @@ class _Net:
     async def close(self):
         for task in self._tasks:
             task.cancel()
+        for result in await asyncio.gather(*self._tasks, return_exceptions=True):
+            if isinstance(result, Exception):  # a relay that broke, not one we cancelled
+                raise result
         for writer in self._writers:
             writer.close()
             try:
@@ -261,25 +264,42 @@ def test_wrong_handshake_magic_rejected_and_transport_closed():
 
 
 @pytest.mark.parametrize(
-    ("direction", "offset", "checker"),
+    ("flips", "checker", "error"),
     [
-        ("i2r", 10, "initiator"),  # X25519 value in hello_i
-        ("r2i", 10, "initiator"),  # X25519 value in hello_r
-        ("r2i", 1000, "initiator"),  # ML-KEM ciphertext in hello_r
-        ("r2i", HELLO_R_SIZE + 5, "initiator"),  # confirm_r
-        ("i2r", HELLO_I_SIZE + 5, "responder"),  # confirm_i
+        ({"flip_i2r": 10}, "initiator", "key confirmation"),  # X25519 value in hello_i
+        # the seed part (rho) of the ML-KEM key, so the key stays valid
+        ({"flip_i2r": HELLO_I_SIZE - 5}, "initiator", "key confirmation"),
+        ({"flip_r2i": 10}, "initiator", "key confirmation"),  # X25519 value in hello_r
+        ({"flip_r2i": 1000}, "initiator", "key confirmation"),  # ML-KEM ciphertext in hello_r
+        # both hellos: the case the ProVerif queries leave to the tests
+        ({"flip_i2r": 10, "flip_r2i": 10}, "initiator", "key confirmation"),
+        ({"flip_r2i": HELLO_R_SIZE + 5}, "initiator", "key confirmation"),  # confirm_r
+        ({"flip_i2r": HELLO_I_SIZE + 5}, "responder", "key confirmation"),  # confirm_i
+        ({"flip_i2r": 6}, "responder", "unexpected role byte"),  # "I" becomes "H"
+        ({"flip_r2i": 6}, "initiator", "unexpected role byte"),  # "R" becomes "S"
     ],
 )
-def test_tampered_handshake_fails_key_confirmation(direction, offset, checker):
+def test_tampered_handshake_is_caught(flips, checker, error):
     async def scenario(net):
-        a, b = await net.relayed(**{f"flip_{direction}": offset})
-        if checker == "initiator":
-            assert isinstance(a, ChannelError) and "key confirmation" in str(a)
-            assert isinstance(b, ChannelError)  # the initiator hung up; b did not wait
-        else:
-            assert isinstance(b, ChannelError) and "key confirmation" in str(b)
+        a, b = await net.relayed(**flips)
+        checked, other = (a, b) if checker == "initiator" else (b, a)
+        assert isinstance(checked, ChannelError) and error in str(checked)
+        if isinstance(other, SecureChannel):  # it finished first and learns at its next recv
             with pytest.raises(ChannelError):
-                await asyncio.wait_for(a.recv(), 5)
+                await asyncio.wait_for(other.recv(), 5)
+        else:
+            assert isinstance(other, ChannelError)  # it was told at once, it did not wait
+
+    _run(scenario)
+
+
+def test_cancelled_handshake_closes_the_transport():
+    async def scenario(net):
+        (r1, w1), (r2, w2) = await net.streams()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(SecureChannel.initiate(r1, w1), 0.2)  # no answer comes
+        assert w1.is_closing()
+        assert len(await asyncio.wait_for(r2.read(), 2)) == HELLO_I_SIZE  # hello_i, then EOF
 
     _run(scenario)
 
@@ -310,7 +330,7 @@ def test_two_initiators_fail_at_once():
     _run(scenario)
 
 
-def test_v1_peer_gets_a_version_error_not_a_hang():
+def test_v1_initiator_gets_a_version_error_not_a_hang():
     async def scenario(net):
         # a complete PBP1N1 hello_i is one byte shorter than a PBP1N2 one
         (r1, w1), (r2, w2) = await net.streams()
@@ -318,12 +338,25 @@ def test_v1_peer_gets_a_version_error_not_a_hang():
         await w1.drain()
         with pytest.raises(ChannelError, match="PBP1N1"):
             await asyncio.wait_for(SecureChannel.respond(r2, w2), 2)
-        # and a PBP1N1 hello_r reaching a PBP1N2 initiator
-        (r3, w3), (r4, w4) = await net.streams()
-        w4.write(b"PBP1N1" + bytes(1126 - 6))
-        await w4.drain()
-        with pytest.raises(ChannelError, match="PBP1N1"):
-            await asyncio.wait_for(SecureChannel.initiate(r3, w3), 2)
+
+    _run(scenario)
+
+
+def test_v1_responder_that_hangs_up_gives_a_clear_error():
+    async def scenario(net):
+        (r1, w1), (r2, w2) = await net.streams()
+
+        async def v1_responder():
+            # PBP1N1 reads a 1222-byte hello_i, rejects its magic and sends nothing
+            await r2.readexactly(1222)
+            w2.close()
+
+        initiator, _ = await asyncio.wait_for(
+            asyncio.gather(SecureChannel.initiate(r1, w1), v1_responder(), return_exceptions=True),
+            2,
+        )
+        assert isinstance(initiator, ChannelError)
+        assert "closed the connection before sending its hello" in str(initiator)
 
     _run(scenario)
 

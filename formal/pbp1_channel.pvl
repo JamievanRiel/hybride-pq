@@ -129,9 +129,10 @@ letfun verify_proof(pk: bitstring, m: bitstring, s: bitstring) = hybrid_verify(p
 
 (* ------------------------------------------------------------------ events *)
 
-(* Key confirmation. Arguments: hello_i, hello_r, key i->r, key r->i. *)
+(* Key confirmation. The hello an honest side sent: *)
 event InitSendsHello(bitstring).
 event RespSendsHello(bitstring).
+(* Arguments: hello_i, hello_r, key i->r, key r->i. *)
 event InitDerives(bitstring, bitstring, key, key).
 event RespDerives(bitstring, bitstring, key, key).
 event InitConfirms(bitstring, bitstring, key, key).
@@ -225,6 +226,8 @@ let Initiator(a: sk_mldsa, b: sk_slh, pkI: bitstring) =
   (* key confirmation *)
   if confirm_r = block_confirm_r(okm) then
   event InitConfirms(hello_i, hello_r, ki2r, kr2i);
+  (* After the check on purpose: the responder's query then also shows that the
+     initiator passed its own check before sending confirm_i. *)
   event InitDerives(hello_i, hello_r, ki2r, kr2i);
   out(c, block_confirm_i(okm));
   (* authenticate(): the initiator proves first *)
