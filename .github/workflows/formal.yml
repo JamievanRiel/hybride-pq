@@ -21,14 +21,10 @@ env:
   PROVERIF_SHA256: "4871f53c32ab4a04669a060c4886ba5d9080496963fb980a9a62d2c429ceabc4"
 
 jobs:
-  proverif:
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
       - name: Build ProVerif
         run: |
           sudo apt-get update
@@ -38,5 +34,32 @@ jobs:
           tar -xzf "$RUNNER_TEMP/proverif.tar.gz" -C "$RUNNER_TEMP" --no-same-owner
           cd "$RUNNER_TEMP/proverif${PROVERIF_VERSION}"
           ./build -nointeract
-          echo "PROVERIF=$PWD/proverif" >> "$GITHUB_ENV"
-      - run: python formal/verify.py
+          mkdir "$RUNNER_TEMP/bin"
+          cp proverif "$RUNNER_TEMP/bin/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proverif
+          path: ${{ runner.temp }}/bin/proverif
+          retention-days: 1
+
+  proverif:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: proverif
+          path: ${{ runner.temp }}/bin
+      - run: |
+          chmod +x "$RUNNER_TEMP/bin/proverif"
+          echo "PROVERIF=$RUNNER_TEMP/bin/proverif" >> "$GITHUB_ENV"
+      - run: python formal/verify.py --shard ${{ matrix.shard }}/8

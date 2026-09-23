@@ -7,9 +7,12 @@ fails on any difference.
 
 A model can also agree with the claims because it is wrong, so the script runs
 mutants too: copies of the model with one design element removed. Each mutant
-must lose a property through an attack trace that ProVerif reconstructs.
+must lose a property through an attack trace that ProVerif reconstructs. One
+mutant is marked as losing it without a trace: ProVerif no longer proves the
+property, but cannot turn the attack it derives into a trace.
 
 Run from the repository root: python formal/verify.py
+Split the work over machines with --shard I/K, which runs every K-th job.
 Needs ProVerif 2.05 on PATH, in ~/.opam/default/bin, or named in $PROVERIF.
 """
 
@@ -51,9 +54,10 @@ RESULT = re.compile(r"^RESULT (.*) (is true|is false|cannot be proved)\.$", re.M
 
 class Mutant(NamedTuple):
     name: str
-    edits: tuple[tuple[str, str], ...]
+    edits: tuple[tuple[str, str] | tuple[str, str, int], ...]  # old, new, matches (default 1)
     now: frozenset[str]
     must_fail: tuple[str, ...]
+    trace: bool = True  # False: "cannot be proved" is enough
 
 
 MUTANTS = (
@@ -118,10 +122,23 @@ MUTANTS = (
         ("integrity_i2r", "integrity_r2i"),
     ),
     Mutant(
-        "every frame under the same nonce",
-        (("const N1: nonce.  (* counter 1: the first application message *)", "letfun N1 = N0."),),
+        "application data from counter 0, the session proof's counter",
+        (("  ( out(tx, 1)\n  | out(rx, 1)", "  ( out(tx, 0)\n  | out(rx, 0)", 2),),
         frozenset(),
         ("integrity_i2r", "integrity_r2i"),
+    ),
+    Mutant(
+        "every application frame under the same nonce",
+        (
+            (
+                "fun ctr(nat): nonce [data].",
+                "const PROOF_NONCE: nonce.\nconst DATA_NONCE: nonce.\n"
+                "letfun ctr(n: nat) = if n = 0 then PROOF_NONCE else DATA_NONCE.",
+            ),
+        ),
+        frozenset(),
+        ("integrity_i2r", "integrity_r2i"),
+        trace=False,
     ),
     Mutant(
         "no key confirmation checks",
@@ -212,11 +229,19 @@ def parse(output: str) -> dict[str, bool | None]:
 
 
 def mutate(model: str, edits) -> str:
-    for old, new in edits:
-        if model.count(old) != 1:
-            raise ValueError(f"mutant edit must match exactly once: {old!r}")
+    for old, new, *count in edits:
+        matches = count[0] if count else 1
+        if model.count(old) != matches:
+            raise ValueError(f"mutant edit must match exactly {matches} time(s): {old!r}")
         model = model.replace(old, new)
     return model
+
+
+def shard(text: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)/(\d+)", text)
+    if not match or not 1 <= int(match[1]) <= int(match[2]):
+        raise argparse.ArgumentTypeError("expected I/K with 1 <= I <= K, for example 2/8")
+    return int(match[1]), int(match[2])
 
 
 def label(broken: frozenset[str]) -> str:
@@ -255,6 +280,8 @@ def find_proverif() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    parser.add_argument("--shard", type=shard, default=(1, 1), metavar="I/K",
+                        help="run only jobs I, I+K, I+2K, ... of all scenarios and mutants")
     args = parser.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     proverif = find_proverif()
@@ -264,11 +291,20 @@ def main() -> int:
         for combo in itertools.combinations(PRIMITIVES, n)
     ]
     scenarios = [(now, frozenset()) for now in subsets] + [(frozenset(), l) for l in subsets[1:]]
+    mutants = list(MUTANTS)
+    index, count = args.shard
+    if count > 1:
+        numbered = list(enumerate(scenarios + mutants))
+        mine = [item for i, item in numbered if i % count == index - 1]
+        scenarios = [item for item in mine if not isinstance(item, Mutant)]
+        mutants = [item for item in mine if isinstance(item, Mutant)]
     outdir = Path(tempfile.mkdtemp(prefix="pbp1-proverif-"))
-    print(f"{len(scenarios)} scenarios and {len(MUTANTS)} mutants, {args.jobs} jobs, output in {outdir}\n")
+    part = f"shard {index}/{count}: " if count > 1 else ""
+    print(f"{part}{len(scenarios)} scenarios and {len(mutants)} mutants, "
+          f"{args.jobs} jobs, output in {outdir}\n")
 
     jobs = [("scenario", now, later, model) for now, later in scenarios]
-    jobs += [("mutant", m.now, frozenset(), mutate(model, m.edits)) for m in MUTANTS]
+    jobs += [("mutant", m.now, frozenset(), mutate(model, m.edits)) for m in mutants]
     failures = 0
     with ThreadPoolExecutor(args.jobs) as pool:
         futures = [
@@ -286,21 +322,25 @@ def main() -> int:
             )
             print(f"{label(now):<28}{label(later):<28}{seconds:>5.0f}s  {verdict}")
 
-        width = max(len(f"{m.name} (now: {label(m.now)})") for m in MUTANTS) + 2
-        print(f"\n{'mutant':<{width}}{'time':>6}  result")
-        for future, mutant in zip(futures[len(scenarios):], MUTANTS):
+        width = max((len(f"{m.name} (now: {label(m.now)})") for m in mutants), default=0) + 2
+        if mutants:
+            print(f"\n{'mutant':<{width}}{'time':>6}  result")
+        for future, mutant in zip(futures[len(scenarios):], mutants):
             results, seconds = future.result()
             reachable = results.get("reachable_initiator") is False and (
                 results.get("reachable_responder") is False
             )
-            survived = [q for q in mutant.must_fail if results.get(q) is not False]
+            lost = (False,) if mutant.trace else (False, None)
+            survived = [q for q in mutant.must_fail if q not in results or results[q] not in lost]
             failures += bool(survived) or not reachable
             if not reachable:
                 verdict = "MODEL BLOCKS: honest run no longer reachable"
             elif survived:
                 verdict = "SURVIVED: no attack on " + ", ".join(survived)
-            else:
+            elif mutant.trace or all(results[q] is False for q in mutant.must_fail):
                 verdict = "attack found on " + ", ".join(mutant.must_fail)
+            else:
+                verdict = "no longer proved (no trace): " + ", ".join(mutant.must_fail)
             name = f"{mutant.name} (now: {label(mutant.now)})"
             print(f"{name:<{width}}{seconds:>5.0f}s  {verdict}")
 
@@ -308,7 +348,7 @@ def main() -> int:
         print(f"\n{failures} check(s) failed; ProVerif output is in {outdir}")
         return 1
     shutil.rmtree(outdir)
-    print("\nAll scenarios match the claims and every mutant was caught.")
+    print(f"\n{part}All scenarios match the claims and every mutant was caught.")
     return 0
 
 
