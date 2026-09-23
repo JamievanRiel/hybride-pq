@@ -1,16 +1,22 @@
 (* PBP-1 secure channel: a symbolic model for ProVerif 2.05.
 
    Covers docs/PROTOCOL.md section 4: the hybrid X25519 + ML-KEM-768 handshake
-   (version 2, "PBP1N2") with its key schedule and key confirmation (4.1), the
-   first ChaCha20-Poly1305 frame in each direction (4.2) and session binding
-   with hybrid session proofs (4.4). Ordinary sign() signatures (section 3) are
-   in the model as well, because an application may hand them out freely next
-   to a channel.
+   (version 2, "PBP1N2") with its key schedule and key confirmation (4.1),
+   streams of ChaCha20-Poly1305 frames of any length in each direction (4.2)
+   and session binding with hybrid session proofs (4.4). Ordinary sign()
+   signatures (section 3) are in the model as well, because an application may
+   hand them out freely next to a channel.
 
    This file holds no process. formal/verify.py supplies one, of the form
    "process System(...)", whose arguments decide which primitives the attacker
    can break, and when. Read formal/README.md for the scenarios, the expected
    results and what the model leaves out. *)
+
+(* An attack on a frame stream starts from a counter on a private channel.
+   ProVerif's default of 4 attempts to turn such an attack into a trace is not
+   always enough, and a derivation without a trace is reported as "cannot be
+   proved" instead of "false". *)
+set reconstructTrace = 20.
 
 free c: channel.
 
@@ -70,8 +76,9 @@ fun sha3(bitstring): bitstring.
 (* ------------------------------------------------------- ChaCha20-Poly1305 *)
 
 type nonce.
-const N0: nonce.  (* counter 0: the session proof *)
-const N1: nonce.  (* counter 1: the first application message *)
+(* The frame counter in the nonce. Counter 0 carries the session proof, the
+   counters from 1 on carry application data. *)
+fun ctr(nat): nonce [data].
 fun aead_enc(key, nonce, bitstring, bitstring): bitstring.
 reduc forall k: key, n: nonce, m: bitstring, ad: bitstring;
   aead_dec(k, n, aead_enc(k, n, m, ad), ad) = m.
@@ -141,11 +148,12 @@ event RespConfirms(bitstring, bitstring, key, key).
 event InitProves(bitstring, bitstring, bitstring, key, key).
 event InitAccepts(bitstring, bitstring, bitstring, key, key).
 event RespAccepts(bitstring, bitstring, bitstring, key, key).
-(* Arguments: initiator key, responder key, session id, application message. *)
-event InitSends(bitstring, bitstring, bitstring, bitstring).
-event RespSends(bitstring, bitstring, bitstring, bitstring).
-event InitReceives(bitstring, bitstring, bitstring, bitstring).
-event RespReceives(bitstring, bitstring, bitstring, bitstring).
+(* Arguments: initiator key, responder key, session id, frame counter,
+   application message. *)
+event InitSends(bitstring, bitstring, bitstring, nat, bitstring).
+event RespSends(bitstring, bitstring, bitstring, nat, bitstring).
+event InitReceives(bitstring, bitstring, bitstring, nat, bitstring).
+event RespReceives(bitstring, bitstring, bitstring, nat, bitstring).
 (* Arguments: public key, message. *)
 event SigIssued(bitstring, bitstring).
 event SigAccepted(bitstring, bitstring).
@@ -158,10 +166,10 @@ table honest_keys(bitstring).
 (* Sanity: honest parties can finish authenticate() and exchange data. ProVerif
    must answer "false" (reachable). If the model blocked somewhere by mistake,
    every property below would hold for no reason. *)
-query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
-  event(InitReceives(pkI, pkR, session, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
-query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
-  event(RespReceives(pkI, pkR, session, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
+query pkI: bitstring, pkR: bitstring, session: bitstring, n: nat, m: bitstring;
+  event(InitReceives(pkI, pkR, session, n, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
+query pkI: bitstring, pkR: bitstring, session: bitstring, n: nat, m: bitstring;
+  event(RespReceives(pkI, pkR, session, n, m)) && event(HonestKey(pkI)) && event(HonestKey(pkR)) ==> false.
 
 (* Key confirmation: when a side finishes the handshake and the peer's hello
    reached it unchanged, that peer derived the same keys from the same
@@ -191,14 +199,18 @@ query pkI: bitstring, pkR: bitstring, session: bitstring, k1: key, k2: key;
 query secret secret_i2r.
 query secret secret_r2i.
 
-(* Integrity: data received after authenticate() from an honest peer was sent
-   by that peer, on this session. *)
-query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
-  event(RespReceives(pkI, pkR, session, m)) && event(HonestKey(pkI))
-  ==> event(InitSends(pkI, pkR, session, m)).
-query pkI: bitstring, pkR: bitstring, session: bitstring, m: bitstring;
-  event(InitReceives(pkI, pkR, session, m)) && event(HonestKey(pkR))
-  ==> event(RespSends(pkI, pkR, session, m)).
+(* Integrity: data received after authenticate() from an honest peer, as the
+   n-th frame, was sent by that peer as its n-th frame, on this session. A
+   sender sends one frame per counter, so this rules out replayed, reordered,
+   injected and dropped frames, except frames cut off at the end. The
+   injective version cannot be proved: ProVerif abstracts the counters on the
+   private channels tx and rx as never consumed. *)
+query pkI: bitstring, pkR: bitstring, session: bitstring, n: nat, m: bitstring;
+  event(RespReceives(pkI, pkR, session, n, m)) && event(HonestKey(pkI))
+  ==> event(InitSends(pkI, pkR, session, n, m)).
+query pkI: bitstring, pkR: bitstring, session: bitstring, n: nat, m: bitstring;
+  event(InitReceives(pkI, pkR, session, n, m)) && event(HonestKey(pkR))
+  ==> event(RespSends(pkI, pkR, session, n, m)).
 
 (* Domain separation: an ordinary signature that verifies for an honest key was
    issued by sign(), so a session proof never passes as one. The other direction
@@ -232,19 +244,29 @@ let Initiator(a: sk_mldsa, b: sk_slh, pkI: bitstring) =
   out(c, block_confirm_i(okm));
   (* authenticate(): the initiator proves first *)
   event InitProves(pkI, pkR, session, ki2r, kr2i);
-  out(c, aead_enc(ki2r, N0, sign_proof(a, b, proof_message(ROLE_I, session, pkI, pkR)), MAGIC));
+  out(c, aead_enc(ki2r, ctr(0), sign_proof(a, b, proof_message(ROLE_I, session, pkI, pkR)), MAGIC));
   in(c, frame: bitstring);
-  let proof_r = aead_dec(kr2i, N0, frame, MAGIC) in
+  let proof_r = aead_dec(kr2i, ctr(0), frame, MAGIC) in
   if verify_proof(pkR, proof_message(ROLE_R, session, pkR, pkI), proof_r) then
   event InitAccepts(pkI, pkR, session, ki2r, kr2i);
-  (
-    (get honest_keys(=pkR) in
-     new secret_i2r: bitstring;
-     event InitSends(pkI, pkR, session, secret_i2r);
-     out(c, aead_enc(ki2r, N1, secret_i2r, MAGIC)))
-  | (in(c, frame1: bitstring);
-     let m = aead_dec(kr2i, N1, frame1, MAGIC) in
-     event InitReceives(pkI, pkR, session, m))
+  (* send and recv: one loop per direction, each keeping its frame counter
+     on a private channel. A frame that fails to decrypt ends the loop: the
+     channel fails closed. *)
+  new tx: channel;
+  new rx: channel;
+  ( out(tx, 1)
+  | out(rx, 1)
+  | !(in(tx, n: nat);
+      get honest_keys(=pkR) in
+      new secret_i2r: bitstring;
+      event InitSends(pkI, pkR, session, n, secret_i2r);
+      out(c, aead_enc(ki2r, ctr(n), secret_i2r, MAGIC));
+      out(tx, n + 1))
+  | !(in(rx, n: nat);
+      in(c, data_frame: bitstring);
+      let m = aead_dec(kr2i, ctr(n), data_frame, MAGIC) in
+      event InitReceives(pkI, pkR, session, n, m);
+      out(rx, n + 1))
   ).
 
 let Responder(a: sk_mldsa, b: sk_slh, pkR: bitstring) =
@@ -265,21 +287,31 @@ let Responder(a: sk_mldsa, b: sk_slh, pkR: bitstring) =
   if confirm_i = block_confirm_i(okm) then
   event RespConfirms(hello_i, hello_r, ki2r, kr2i);
   in(c, frame: bitstring);
-  let proof_i = aead_dec(ki2r, N0, frame, MAGIC) in
+  let proof_i = aead_dec(ki2r, ctr(0), frame, MAGIC) in
   (* The allowed initiator key the proof matched. Any key may be on the allow
      list, so the attacker picks it, after seeing the frame. *)
   in(c, pkI: bitstring);
   if verify_proof(pkI, proof_message(ROLE_I, session, pkI, pkR), proof_i) then
   event RespAccepts(pkI, pkR, session, ki2r, kr2i);
-  out(c, aead_enc(kr2i, N0, sign_proof(a, b, proof_message(ROLE_R, session, pkR, pkI)), MAGIC));
-  (
-    (get honest_keys(=pkI) in
-     new secret_r2i: bitstring;
-     event RespSends(pkI, pkR, session, secret_r2i);
-     out(c, aead_enc(kr2i, N1, secret_r2i, MAGIC)))
-  | (in(c, frame1: bitstring);
-     let m = aead_dec(ki2r, N1, frame1, MAGIC) in
-     event RespReceives(pkI, pkR, session, m))
+  out(c, aead_enc(kr2i, ctr(0), sign_proof(a, b, proof_message(ROLE_R, session, pkR, pkI)), MAGIC));
+  (* send and recv: one loop per direction, each keeping its frame counter
+     on a private channel. A frame that fails to decrypt ends the loop: the
+     channel fails closed. *)
+  new tx: channel;
+  new rx: channel;
+  ( out(tx, 1)
+  | out(rx, 1)
+  | !(in(tx, n: nat);
+      get honest_keys(=pkI) in
+      new secret_r2i: bitstring;
+      event RespSends(pkI, pkR, session, n, secret_r2i);
+      out(c, aead_enc(kr2i, ctr(n), secret_r2i, MAGIC));
+      out(tx, n + 1))
+  | !(in(rx, n: nat);
+      in(c, data_frame: bitstring);
+      let m = aead_dec(ki2r, ctr(n), data_frame, MAGIC) in
+      event RespReceives(pkI, pkR, session, n, m);
+      out(rx, n + 1))
   ).
 
 (* Ordinary sign(). Conservatively it signs any message the attacker picks,
