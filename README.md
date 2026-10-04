@@ -21,6 +21,10 @@ to break both.
 > data until such a review has happened. If you need production cryptography today,
 > read [Should I use this?](#should-i-use-this) first.
 
+**Break it.** You can help with that missing review. [CHALLENGE.md](CHALLENGE.md) lists
+every security claim PBP-1 makes, what counts as breaking one, and how a confirmed
+finding is credited.
+
 ## Contents
 
 - [What's inside](#whats-inside)
@@ -541,5 +545,6 @@ confirmation), which Pingobit's `PBP1N1` channel doesn't speak. Session binding
 were added here.
 
 Found a weakness? Please report it privately, as described in [SECURITY.md](SECURITY.md).
+What counts as a finding, and how findings are credited, is in [CHALLENGE.md](CHALLENGE.md).
 
 Released under the [MIT License](LICENSE).

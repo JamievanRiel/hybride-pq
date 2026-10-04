@@ -14,9 +14,12 @@ through GitHub: open the **Security** tab of this repository and choose
 **Report a vulnerability**.
 
 Please include what you found, which component it affects (signatures, channel,
-keystore, encodings), and, if possible, a way to reproduce it. You'll get a response as
-soon as possible. Once a fix is available, the report will be published with credit to
-you, unless you prefer otherwise.
+keystore, encodings), and, if possible, a way to reproduce it. You'll get a first
+response within 7 days. Once a fix is available, the report will be published with
+credit to you, unless you prefer otherwise.
+
+[CHALLENGE.md](CHALLENGE.md) lists every security claim PBP-1 makes and what counts as
+breaking one. Confirmed findings are credited there.
 
 ## Scope
 
